@@ -224,7 +224,6 @@ fn values_to_list_options(values: &[Value]) -> Vec<ListOption<String>> {
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
