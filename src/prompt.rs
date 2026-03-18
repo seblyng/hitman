@@ -54,7 +54,7 @@ pub fn get_interaction() -> Box<dyn UserInteraction> {
 }
 
 pub trait UserInteraction {
-    fn prompt(&self, key: &str) -> Result<String>;
+    fn prompt(&self, key: &str, fallback: Option<&str>) -> Result<String>;
     fn select(&self, key: &str, values: &[Value]) -> Result<JinjaValue>;
     fn select_multiple(
         &self,
@@ -76,12 +76,16 @@ where
     loop {
         match prepare_request(resolved, &vars)? {
             Complete(req) => return Ok(req),
-            ValueMissing { key, multiple } => {
+            ValueMissing {
+                key,
+                fallback,
+                multiple,
+            } => {
                 let value = match scope.lookup(&key)? {
                     Replacement::Value(value) => JinjaValue::from(value),
-                    Replacement::ValueNotFound { key } => {
-                        JinjaValue::from(interaction.prompt(&key)?)
-                    }
+                    Replacement::ValueNotFound { key } => JinjaValue::from(
+                        interaction.prompt(&key, fallback.as_deref())?,
+                    ),
                     Replacement::MultipleValuesFound { key, values } => {
                         if multiple {
                             interaction.select_multiple(&key, &values)?
@@ -114,7 +118,10 @@ impl NoUserInteraction {
 }
 
 impl UserInteraction for NoUserInteraction {
-    fn prompt(&self, key: &str) -> Result<String> {
+    fn prompt(&self, key: &str, fallback: Option<&str>) -> Result<String> {
+        if let Some(val) = fallback.map(ToString::to_string) {
+            return Ok(val);
+        }
         bail!("Replacement not found: {key}");
     }
 
@@ -136,8 +143,8 @@ impl UserInteraction for NoUserInteraction {
 pub struct CliUserInteraction;
 
 impl UserInteraction for CliUserInteraction {
-    fn prompt(&self, key: &str) -> Result<String> {
-        prompt_user(key)
+    fn prompt(&self, key: &str, fallback: Option<&str>) -> Result<String> {
+        prompt_user(key, fallback)
     }
 
     fn select(&self, key: &str, values: &[toml::Value]) -> Result<JinjaValue> {
@@ -153,14 +160,18 @@ impl UserInteraction for CliUserInteraction {
     }
 }
 
-fn prompt_user(key: &str) -> Result<String> {
+fn prompt_user(key: &str, fallback: Option<&str>) -> Result<String> {
+    let fb = fallback.unwrap_or("");
+
     if key.ends_with("_date") || key.ends_with("Date") {
         if let Some(date) = prompt_for_date(key)? {
             return Ok(date);
         }
     }
 
-    let input = Text::new(&format!("Enter value for {key}")).prompt()?;
+    let input = Text::new(&format!("Enter value for {key}"))
+        .with_default(fb)
+        .prompt()?;
 
     Ok(input)
 }
