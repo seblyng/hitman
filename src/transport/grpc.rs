@@ -23,8 +23,6 @@ use tonic::{
 
 use crate::{resolve::Resolved, util::truncate};
 
-use super::ExecutionResult;
-
 const PROTO_HEADER: &str = "proto";
 
 #[derive(Clone)]
@@ -113,7 +111,7 @@ pub fn prepare_request(
     })
 }
 
-pub async fn execute(req: &GrpcRequest) -> Result<ExecutionResult> {
+pub async fn send(req: &GrpcRequest) -> Result<(Value, std::time::Duration)> {
     let method = load_method(req)?;
     let request_desc = method.input();
     let response_desc = method.output();
@@ -151,12 +149,13 @@ pub async fn execute(req: &GrpcRequest) -> Result<ExecutionResult> {
 
     let response_message = response.into_inner();
     let json = serialize_message(&response_message)?;
-    println!("{}", serde_json::to_string_pretty(&json)?);
 
-    Ok(ExecutionResult {
-        elapsed,
-        json: Some(json),
-    })
+    Ok((json, elapsed))
+}
+
+pub fn finish_response(json: &Value) -> Result<Option<Value>> {
+    println!("{}", serde_json::to_string_pretty(json)?);
+    Ok(Some(json.clone()))
 }
 
 struct DynamicCodec {

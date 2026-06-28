@@ -25,6 +25,17 @@ pub struct ExecutionResult {
     pub json: Option<Value>,
 }
 
+pub struct TransportResponse {
+    pub elapsed: Duration,
+    response: TransportResponseBody,
+}
+
+enum TransportResponseBody {
+    Http(reqwest::Response),
+    GraphQL(reqwest::Response),
+    Grpc(Value),
+}
+
 pub fn prepare_request(
     resolved: &Resolved,
     provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
@@ -45,15 +56,52 @@ pub fn prepare_request(
     }
 }
 
-pub async fn execute(
+pub async fn send(
     client: &Client,
     request: &PreparedRequest,
-) -> Result<ExecutionResult> {
+) -> Result<TransportResponse> {
     match request {
-        PreparedRequest::Http(req) => http::execute(client, req).await,
-        PreparedRequest::GraphQL(req) => graphql::execute(client, req).await,
-        PreparedRequest::Grpc(req) => grpc::execute(req).await,
+        PreparedRequest::Http(req) => {
+            let (response, elapsed) = http::send(client, req).await?;
+            Ok(TransportResponse {
+                elapsed,
+                response: TransportResponseBody::Http(response),
+            })
+        }
+        PreparedRequest::GraphQL(req) => {
+            let (response, elapsed) = graphql::send(client, req).await?;
+            Ok(TransportResponse {
+                elapsed,
+                response: TransportResponseBody::GraphQL(response),
+            })
+        }
+        PreparedRequest::Grpc(req) => {
+            let (json, elapsed) = grpc::send(req).await?;
+            Ok(TransportResponse {
+                elapsed,
+                response: TransportResponseBody::Grpc(json),
+            })
+        }
     }
+}
+
+pub async fn finish_response(
+    response: TransportResponse,
+) -> Result<ExecutionResult> {
+    let json = match response.response {
+        TransportResponseBody::Http(response) => {
+            http::finish_response(response).await?
+        }
+        TransportResponseBody::GraphQL(response) => {
+            graphql::finish_response(response).await?
+        }
+        TransportResponseBody::Grpc(json) => grpc::finish_response(&json)?,
+    };
+
+    Ok(ExecutionResult {
+        elapsed: response.elapsed,
+        json,
+    })
 }
 
 pub fn print_request(request: &PreparedRequest) {

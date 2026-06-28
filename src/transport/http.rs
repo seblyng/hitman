@@ -14,8 +14,6 @@ use std::fmt::Write;
 
 use crate::{env::HitmanCookieJar, util::truncate};
 
-use super::ExecutionResult;
-
 #[derive(Clone)]
 pub struct HttpBody {
     body: String,
@@ -125,12 +123,14 @@ pub fn parse_headers(req: &httparse::Request<'_, '_>) -> Result<HeaderMap> {
     Ok(headers)
 }
 
-pub async fn execute(
+pub async fn send(
     client: &Client,
     req: &HttpRequest,
-) -> Result<ExecutionResult> {
-    let (response, elapsed) = do_request(client, req).await?;
+) -> Result<(Response, Duration)> {
+    do_request(client, req).await
+}
 
+pub async fn finish_response(response: Response) -> Result<Option<Value>> {
     print_response(&response)?;
 
     let json = response.json::<Value>().await.ok();
@@ -138,7 +138,7 @@ pub async fn execute(
         println!("{}", serde_json::to_string_pretty(json)?);
     }
 
-    Ok(ExecutionResult { elapsed, json })
+    Ok(json)
 }
 
 pub async fn do_request(
