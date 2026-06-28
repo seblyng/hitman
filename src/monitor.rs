@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use log::warn;
 use tokio::time::sleep;
 
@@ -6,9 +6,13 @@ use std::time::Duration;
 
 use crate::{
     prompt::get_interaction,
-    request::{build_client, do_request},
     resolve::Resolved,
-    scope::Scope, substitute::prepare_request,
+    scope::Scope,
+    transport::{
+        self,
+        http::{build_client, do_request},
+        PreparedRequest,
+    },
 };
 
 pub async fn monitor(
@@ -25,7 +29,10 @@ pub async fn monitor(
     warn!("# Repeating every {delay} seconds, until interrupted...");
 
     let interaction = get_interaction(scope.clone());
-    let req = prepare_request(resolved, interaction)?;
+    let req = match transport::prepare_request(resolved, interaction)? {
+        PreparedRequest::Http(req) => req,
+        PreparedRequest::GraphQL(req) => req.http,
+    };
 
     loop {
         let res = do_request(&client, &req).await;

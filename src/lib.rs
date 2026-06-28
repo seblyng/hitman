@@ -6,6 +6,7 @@ pub mod request;
 pub mod resolve;
 pub mod scope;
 pub mod substitute;
+pub mod transport;
 pub mod util;
 
 pub mod prompt;
