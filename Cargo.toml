@@ -34,6 +34,7 @@ prost-reflect = { version = "0.16", features = ["serde"] }
 protox = "0.9"
 http = "1"
 prost = "0.14"
+prost-types = "0.14"
 
 [dev-dependencies]
 mktemp = "0.5.1"

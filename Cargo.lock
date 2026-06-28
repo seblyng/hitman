@@ -717,6 +717,7 @@ dependencies = [
  "notify",
  "prost",
  "prost-reflect",
+ "prost-types",
  "protox",
  "reqwest",
  "serde_json",

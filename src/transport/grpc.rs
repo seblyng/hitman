@@ -24,12 +24,19 @@ use tonic::{
 use crate::{resolve::Resolved, util::truncate};
 
 const PROTO_HEADER: &str = "proto";
+const PROTOSET_HEADER: &str = "protoset";
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DescriptorSource {
+    Proto(PathBuf),
+    Protoset(PathBuf),
+}
 
 #[derive(Clone)]
 pub struct GrpcRequest {
     pub endpoint: String,
     pub path: String,
-    pub proto_path: PathBuf,
+    pub descriptor_source: DescriptorSource,
     pub metadata: Vec<(String, String)>,
     pub body: String,
 }
@@ -37,7 +44,14 @@ pub struct GrpcRequest {
 impl Display for GrpcRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "GRPC {}{}", self.endpoint, self.path)?;
-        writeln!(f, "Proto: {}", self.proto_path.display())?;
+        match &self.descriptor_source {
+            DescriptorSource::Proto(path) => {
+                writeln!(f, "Proto: {}", path.display())?
+            }
+            DescriptorSource::Protoset(path) => {
+                writeln!(f, "Protoset: {}", path.display())?
+            }
+        }
         for (key, val) in &self.metadata {
             writeln!(f, "{key}: {val}")?;
         }
@@ -81,7 +95,7 @@ pub fn prepare_request(
 
     let (endpoint, path) = parse_target(target)?;
 
-    let mut proto_path = None;
+    let mut descriptor_source = None;
     let mut metadata = Vec::new();
 
     for line in lines {
@@ -92,20 +106,32 @@ pub fn prepare_request(
         let value = value.trim();
 
         if key.eq_ignore_ascii_case(PROTO_HEADER) {
-            proto_path = Some(resolve_proto_path(resolved, value));
+            if descriptor_source.is_some() {
+                bail!("Invalid gRPC request: specify only one of Proto or Protoset");
+            }
+            descriptor_source = Some(DescriptorSource::Proto(
+                resolve_file_path(resolved, value),
+            ));
+        } else if key.eq_ignore_ascii_case(PROTOSET_HEADER) {
+            if descriptor_source.is_some() {
+                bail!("Invalid gRPC request: specify only one of Proto or Protoset");
+            }
+            descriptor_source = Some(DescriptorSource::Protoset(
+                resolve_file_path(resolved, value),
+            ));
         } else {
             metadata.push((key.to_ascii_lowercase(), value.to_string()));
         }
     }
 
-    let proto_path = proto_path.context(
-        "Invalid gRPC request: missing Proto header pointing to a .proto file",
+    let descriptor_source = descriptor_source.context(
+        "Invalid gRPC request: missing Proto or Protoset header pointing to descriptors",
     )?;
 
     Ok(GrpcRequest {
         endpoint,
         path,
-        proto_path,
+        descriptor_source,
         metadata,
         body: body.to_string(),
     })
@@ -264,7 +290,7 @@ fn parse_target(target: &str) -> Result<(String, String)> {
     Ok((format!("{scheme}://{authority}"), path.to_string()))
 }
 
-fn resolve_proto_path(resolved: &Resolved, value: &str) -> PathBuf {
+fn resolve_file_path(resolved: &Resolved, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {
         path
@@ -296,13 +322,7 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 }
 
 fn load_method(req: &GrpcRequest) -> Result<MethodDescriptor> {
-    let import_path = req
-        .proto_path
-        .parent()
-        .context("Proto file must have a parent directory")?;
-    let file_descriptors =
-        protox::compile([req.proto_path.as_path()], [import_path])?;
-    let pool = DescriptorPool::from_file_descriptor_set(file_descriptors)?;
+    let pool = load_descriptor_pool(&req.descriptor_source)?;
 
     let (service_name, method_name) = req
         .path
@@ -318,6 +338,28 @@ fn load_method(req: &GrpcRequest) -> Result<MethodDescriptor> {
         .with_context(|| format!("gRPC method not found: {method_name}"))?;
 
     Ok(method)
+}
+
+fn load_descriptor_pool(source: &DescriptorSource) -> Result<DescriptorPool> {
+    let descriptors = match source {
+        DescriptorSource::Proto(proto_path) => {
+            let import_path = proto_path
+                .parent()
+                .context("Proto file must have a parent directory")?;
+            protox::compile([proto_path.as_path()], [import_path])?
+        }
+        DescriptorSource::Protoset(protoset_path) => {
+            let bytes = std::fs::read(protoset_path).with_context(|| {
+                format!(
+                    "Failed to read protoset file {}",
+                    protoset_path.display()
+                )
+            })?;
+            prost_types::FileDescriptorSet::decode(bytes.as_slice())?
+        }
+    };
+
+    Ok(DescriptorPool::from_file_descriptor_set(descriptors)?)
 }
 
 fn serialize_message(message: &DynamicMessage) -> Result<Value> {
@@ -366,8 +408,10 @@ Authorization: Bearer abc
         assert_eq!(request.endpoint, "http://localhost:50051");
         assert_eq!(request.path, "/example.UserService/GetUser");
         assert_eq!(
-            request.proto_path,
-            PathBuf::from("/tmp/project/proto/user.proto")
+            request.descriptor_source,
+            DescriptorSource::Proto(PathBuf::from(
+                "/tmp/project/proto/user.proto"
+            ))
         );
         assert_eq!(
             request.metadata,
@@ -413,7 +457,52 @@ Authorization: Bearer abc
         let request = GrpcRequest {
             endpoint: "http://localhost:50051".into(),
             path: "/example.UserService/GetUser".into(),
-            proto_path: proto,
+            descriptor_source: DescriptorSource::Proto(proto),
+            metadata: vec![],
+            body: r#"{"id":"123"}"#.into(),
+        };
+
+        let method = load_method(&request).unwrap();
+
+        assert_eq!(method.name(), "GetUser");
+        assert_eq!(method.input().full_name(), "example.GetUserRequest");
+        assert_eq!(method.output().full_name(), "example.GetUserResponse");
+    }
+
+    #[test]
+    fn loads_method_from_protoset() {
+        let tmp = Temp::new_dir().unwrap();
+        let proto = tmp.join("user.proto");
+        fs::write(
+            &proto,
+            r#"
+                syntax = "proto3";
+                package example;
+
+                service UserService {
+                    rpc GetUser (GetUserRequest) returns (GetUserResponse);
+                }
+
+                message GetUserRequest {
+                    string id = 1;
+                }
+
+                message GetUserResponse {
+                    string name = 1;
+                }
+            "#,
+        )
+        .unwrap();
+
+        let descriptors =
+            protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
+        let protoset = tmp.join("protoset.bin");
+        fs::write(&protoset, descriptors.encode_to_vec()).unwrap();
+
+        let request = GrpcRequest {
+            endpoint: "http://localhost:50051".into(),
+            path: "/example.UserService/GetUser".into(),
+            descriptor_source: DescriptorSource::Protoset(protoset),
             metadata: vec![],
             body: r#"{"id":"123"}"#.into(),
         };
