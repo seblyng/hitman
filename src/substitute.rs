@@ -1,25 +1,8 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::Context;
-use httparse::Status;
 use minijinja::value::{Enumerator, ObjectRepr};
-use minijinja::{Environment, UndefinedBehavior, Value, value::Object};
-use reqwest::{
-    Method, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
-};
-use std::{
-    fs::read_to_string,
-    str::{self, FromStr},
-};
-
-use crate::request::find_args;
-use crate::{
-    request::{HitmanBody, HitmanRequest},
-    resolve::{Resolved, ResolvedAs},
-};
+use minijinja::{value::Object, Environment, UndefinedBehavior, Value};
 
 #[derive(Debug, Clone)]
 pub enum SubstituteValue {
@@ -177,94 +160,6 @@ impl Object for MultiSelect {
     }
 }
 
-pub fn prepare_request(
-    resolved: &Resolved,
-    provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
-) -> anyhow::Result<HitmanRequest> {
-    let input = read_to_string(resolved.http_file())?;
-    let buf = substitute(&input, provider.clone())?;
-
-    let mut headers_buf = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers_buf);
-
-    let parse_result = req
-        .parse(buf.as_bytes())
-        .context("Invalid input: malformed request")?;
-
-    let method = req.method.context("Invalid input: HTTP method not found")?;
-    let url = req.path.context("Invalid input: URL not found")?;
-
-    let method = Method::from_str(method)?;
-    let url = Url::parse(url)?;
-
-    let body = match &resolved.resolved_as {
-        ResolvedAs::GraphQL { graphql_path, .. } => {
-            let body = read_to_string(graphql_path)?;
-            let args = find_args(graphql_path)?;
-
-            if args.is_empty() {
-                Some(HitmanBody::GraphQL {
-                    body,
-                    variables: None,
-                })
-            } else {
-                let mut map: HashMap<String, serde_json::Value> =
-                    HashMap::new();
-
-                for key in args {
-                    let value = match provider.lookup_value(&key.name) {
-                        None => serde_json::to_value(
-                            provider.prompt(&key.name, None)?,
-                        ),
-                        Some(SubstituteValue::Single(value)) => {
-                            serde_json::to_value(value)
-                        }
-                        Some(SubstituteValue::Multiple(values)) => {
-                            serde_json::to_value(values)
-                        }
-                    }?;
-
-                    map.insert(key.name, value);
-                }
-
-                let variables = serde_json::to_value(map)?;
-
-                Some(HitmanBody::GraphQL {
-                    body,
-                    variables: Some(variables),
-                })
-            }
-        }
-        ResolvedAs::Simple { .. } => match parse_result {
-            Status::Complete(offset) => Some(HitmanBody::Plain {
-                body: buf[offset..].to_string(),
-            }),
-            Status::Partial => None,
-        },
-    };
-
-    let mut headers = HeaderMap::new();
-
-    for header in req.headers {
-        // The parse_http crate is weird, it fills the array with empty headers
-        // if a partial request is parsed.
-        if header.name.is_empty() {
-            break;
-        }
-        let value = str::from_utf8(header.value)?;
-        let header_name = HeaderName::from_str(header.name)?;
-        let header_value = HeaderValue::from_str(value)?;
-        headers.insert(header_name, header_value);
-    }
-
-    Ok(HitmanRequest {
-        headers,
-        url,
-        method,
-        body,
-    })
-}
-
 pub fn substitute(
     input: &str,
     provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
@@ -308,6 +203,7 @@ pub fn substitute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     struct TestProvider {
         vars: HashMap<String, SubstituteValue>,
@@ -424,9 +320,11 @@ mod tests {
     #[test]
     fn substitutes_default_value() {
         let provider = create_provider();
-        let res =
-            substitute("foo: {{ href | fallback('fallback.com') }}\n", Arc::new(provider))
-                .unwrap();
+        let res = substitute(
+            "foo: {{ href | fallback('fallback.com') }}\n",
+            Arc::new(provider),
+        )
+        .unwrap();
 
         assert_eq!(res, "foo: [fallback: fallback.com]\n".to_string());
     }
@@ -442,7 +340,8 @@ mod tests {
     #[test]
     fn substitutes_single_variable_with_spaces() {
         let provider = create_provider();
-        let res = substitute("foo {{ url  }}\nbar\n", Arc::new(provider)).unwrap();
+        let res =
+            substitute("foo {{ url  }}\nbar\n", Arc::new(provider)).unwrap();
 
         assert_eq!(res, "foo example.com\nbar\n".to_string());
     }
@@ -450,7 +349,9 @@ mod tests {
     #[test]
     fn substitutes_one_variable_per_line() {
         let provider = create_provider();
-        let res = substitute("foo {{url}}\nbar {{token}}\n", Arc::new(provider)).unwrap();
+        let res =
+            substitute("foo {{url}}\nbar {{token}}\n", Arc::new(provider))
+                .unwrap();
 
         assert_eq!(res, "foo example.com\nbar abc123\n".to_string());
     }
@@ -458,7 +359,9 @@ mod tests {
     #[test]
     fn substitutes_variable_on_the_same_line() {
         let provider = create_provider();
-        let res = substitute("foo {{url}}, bar {{token}}\n", Arc::new(provider)).unwrap();
+        let res =
+            substitute("foo {{url}}, bar {{token}}\n", Arc::new(provider))
+                .unwrap();
 
         assert_eq!(res, "foo example.com, bar abc123\n".to_string());
     }
@@ -466,7 +369,8 @@ mod tests {
     #[test]
     fn substitutes_variable_with_underscore_and_number_in_name() {
         let provider = create_provider();
-        let res = substitute("foo: {{ api_url1 }}", Arc::new(provider)).unwrap();
+        let res =
+            substitute("foo: {{ api_url1 }}", Arc::new(provider)).unwrap();
 
         assert_eq!(res, "foo: foo.com".to_string());
     }
@@ -474,7 +378,11 @@ mod tests {
     #[test]
     fn substitutes_list_joined() {
         let provider = create_provider();
-        let res = substitute("foo: {{ list | select_multiple | join('') }}", Arc::new(provider)).unwrap();
+        let res = substitute(
+            "foo: {{ list | select_multiple | join('') }}",
+            Arc::new(provider),
+        )
+        .unwrap();
 
         assert_eq!(res, "foo: 123".to_string());
     }
@@ -482,8 +390,11 @@ mod tests {
     #[test]
     fn substitutes_comma_separated_list() {
         let provider = create_provider();
-        let res =
-            substitute("foo: [ {{ list | select_multiple | join(', ') }} ]", Arc::new(provider)).unwrap();
+        let res = substitute(
+            "foo: [ {{ list | select_multiple | join(', ') }} ]",
+            Arc::new(provider),
+        )
+        .unwrap();
 
         assert_eq!(res, "foo: [ 1, 2, 3 ]".to_string());
     }
@@ -491,8 +402,11 @@ mod tests {
     #[test]
     fn substitutes_list_quoted_join() {
         let provider = create_provider();
-        let res =
-            substitute(r#"foo: {{ list | select_multiple }}"#, Arc::new(provider)).unwrap();
+        let res = substitute(
+            r#"foo: {{ list | select_multiple }}"#,
+            Arc::new(provider),
+        )
+        .unwrap();
 
         assert_eq!(res, r#"foo: ["1", "2", "3"]"#.to_string());
     }
@@ -512,8 +426,11 @@ mod tests {
     #[test]
     fn returns_value_missing_when_var_missing_but_other_has_default() {
         let provider = create_provider();
-        let res = substitute("{{ with_default | fallback('x') }} {{ missing }}", Arc::new(provider))
-            .unwrap();
+        let res = substitute(
+            "{{ with_default | fallback('x') }} {{ missing }}",
+            Arc::new(provider),
+        )
+        .unwrap();
 
         assert_eq!(res, "[fallback: x] [missing: missing]".to_string());
     }
@@ -521,8 +438,11 @@ mod tests {
     #[test]
     fn fallback_filter_is_noop_when_value_present() {
         let provider = create_provider();
-        let res =
-            substitute("{{ url | fallback('fallback.com') }}", Arc::new(provider)).unwrap();
+        let res = substitute(
+            "{{ url | fallback('fallback.com') }}",
+            Arc::new(provider),
+        )
+        .unwrap();
 
         assert_eq!(res, "example.com".to_string());
     }

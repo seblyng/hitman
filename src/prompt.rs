@@ -1,6 +1,6 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use fuzzy_matcher::skim::SkimMatcherV2;
-use inquire::{DateSelect, MultiSelect, Select, Text, list_option::ListOption};
+use inquire::{list_option::ListOption, DateSelect, MultiSelect, Select, Text};
 use minijinja::Value as JinjaValue;
 use std::{
     collections::HashMap,
