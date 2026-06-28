@@ -32,6 +32,9 @@ pub async fn monitor(
     let req = match transport::prepare_request(resolved, interaction)? {
         PreparedRequest::Http(req) => req,
         PreparedRequest::GraphQL(req) => req.http,
+        PreparedRequest::Grpc(_) => {
+            bail!("Monitor mode does not support gRPC requests yet")
+        }
     };
 
     loop {

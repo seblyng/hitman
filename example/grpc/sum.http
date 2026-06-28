@@ -1,0 +1,7 @@
+GRPC grpcb.in:9000/addsvc.Add/Sum
+Proto: ./addsvc.proto
+
+{
+  "a": 2,
+  "b": 40
+}

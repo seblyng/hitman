@@ -10,12 +10,14 @@ use crate::{
 };
 
 pub mod graphql;
+pub mod grpc;
 pub mod http;
 
 #[derive(Clone)]
 pub enum PreparedRequest {
     Http(http::HttpRequest),
     GraphQL(graphql::GraphQLRequest),
+    Grpc(grpc::GrpcRequest),
 }
 
 pub struct ExecutionResult {
@@ -31,6 +33,9 @@ pub fn prepare_request(
     let rendered = substitute::substitute(&input, provider.clone())?;
 
     match &resolved.resolved_as {
+        ResolvedAs::Simple { .. } if grpc::is_grpc_request(&rendered) => Ok(
+            PreparedRequest::Grpc(grpc::prepare_request(resolved, &rendered)?),
+        ),
         ResolvedAs::Simple { .. } => {
             Ok(PreparedRequest::Http(http::prepare_request(&rendered)?))
         }
@@ -47,6 +52,7 @@ pub async fn execute(
     match request {
         PreparedRequest::Http(req) => http::execute(client, req).await,
         PreparedRequest::GraphQL(req) => graphql::execute(client, req).await,
+        PreparedRequest::Grpc(req) => grpc::execute(req).await,
     }
 }
 
@@ -54,5 +60,6 @@ pub fn print_request(request: &PreparedRequest) {
     match request {
         PreparedRequest::Http(req) => http::print_request(req),
         PreparedRequest::GraphQL(req) => graphql::print_request(req),
+        PreparedRequest::Grpc(req) => grpc::print_request(req),
     }
 }
