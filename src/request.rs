@@ -26,8 +26,19 @@ pub async fn make_request(resolved: &Resolved, scope: &Scope) -> Result<()> {
         Color::Yellow,
         Streams::Stderr,
     );
-    let result = transport::execute(&client, &req).await?;
-    spinner.stop();
+
+    let response = match transport::send(&client, &req).await {
+        Ok(response) => {
+            spinner.stop();
+            response
+        }
+        Err(err) => {
+            spinner.stop();
+            return Err(err);
+        }
+    };
+
+    let result = transport::finish_response(response).await?;
 
     if let Some(json) = result.json {
         let vars = extract_variables(&json, scope)?;

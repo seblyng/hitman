@@ -12,7 +12,7 @@ use crate::{
     substitute::{SubstituteProvider, SubstituteValue},
 };
 
-use super::{http, ExecutionResult};
+use super::http;
 
 #[derive(Clone)]
 pub struct GraphQLRequest {
@@ -51,21 +51,22 @@ pub fn prepare_request(
     Ok(GraphQLRequest { http })
 }
 
-pub async fn execute(
+pub async fn send(
     client: &Client,
     req: &GraphQLRequest,
-) -> Result<ExecutionResult> {
-    let (response, elapsed) = http::do_request(client, &req.http).await?;
+) -> Result<(reqwest::Response, std::time::Duration)> {
+    http::do_request(client, &req.http).await
+}
 
+pub async fn finish_response(
+    response: reqwest::Response,
+) -> Result<Option<Value>> {
     http::print_response(&response)?;
 
     if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
         if content_type.to_str()?.contains("text/event-stream") {
             parse_stream_output(response).await?;
-            return Ok(ExecutionResult {
-                elapsed,
-                json: None,
-            });
+            return Ok(None);
         }
     }
 
@@ -74,7 +75,7 @@ pub async fn execute(
         println!("{}", serde_json::to_string_pretty(json)?);
     }
 
-    Ok(ExecutionResult { elapsed, json })
+    Ok(json)
 }
 
 pub fn print_request(req: &GraphQLRequest) {
