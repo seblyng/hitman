@@ -38,6 +38,9 @@ pub async fn flurry_attack(
     let req = match transport::prepare_request(resolved, interaction)? {
         PreparedRequest::Http(req) => req,
         PreparedRequest::GraphQL(req) => req.http,
+        PreparedRequest::Grpc(_) => {
+            bail!("Flurry mode does not support gRPC requests yet")
+        }
     };
 
     let t = std::time::Instant::now();

@@ -91,6 +91,36 @@ Then run requests directly by passing a request file:
 $ hitman login.http
 ```
 
+## gRPC requests
+
+Hitman supports unary gRPC requests in `.http` files using the `GRPC`
+keyword. The request body is JSON, and `Proto` points to the local `.proto`
+file used to encode the request and decode the response.
+
+```http
+GRPC {{grpc_host}}/package.Service/Method
+Proto: ./proto/service.proto
+Authorization: Bearer {{token}}
+
+{
+    "id": "{{user_id}}"
+}
+```
+
+Use `grpcs://` for server-side TLS:
+
+```http
+GRPC grpcs://example.com/package.Service/Method
+Proto: ./proto/service.proto
+
+{}
+```
+
+Currently, gRPC support is limited to unary calls with local `.proto` files.
+Server reflection and streaming RPCs are not supported yet.
+
+See `example/grpc/` for requests against the public `grpcb.in` test service.
+
 Or, use the interactive mode:
 
 ```

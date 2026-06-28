@@ -1,0 +1,7 @@
+GRPC grpcb.in:9000/addsvc.Add/Concat
+Proto: ./addsvc.proto
+
+{
+  "a": "hello ",
+  "b": "grpc"
+}
