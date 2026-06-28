@@ -1,4 +1,4 @@
-GRPC grpcb.in:9000/addsvc.Add/Sum
+GRPC grpcs://grpcb.in:9001/addsvc.Add/Sum
 Proto: ./addsvc.proto
 
 {

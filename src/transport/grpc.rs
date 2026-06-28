@@ -17,7 +17,7 @@ use serde_json::Value;
 use tonic::{
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
     metadata::{AsciiMetadataKey, MetadataValue},
-    transport::Endpoint,
+    transport::{ClientTlsConfig, Endpoint},
     Request, Status,
 };
 
@@ -151,7 +151,7 @@ pub async fn send(req: &GrpcRequest) -> Result<(Value, std::time::Duration)> {
     let message = DynamicMessage::deserialize(request_desc, &mut deserializer)?;
     deserializer.end()?;
 
-    let endpoint = Endpoint::from_shared(req.endpoint.clone())?;
+    let endpoint = build_endpoint(&req.endpoint)?;
     let channel = endpoint.connect().await?;
     let mut client = tonic::client::Grpc::new(channel);
     client
@@ -177,6 +177,16 @@ pub async fn send(req: &GrpcRequest) -> Result<(Value, std::time::Duration)> {
     let json = serialize_message(&response_message)?;
 
     Ok((json, elapsed))
+}
+
+fn build_endpoint(endpoint: &str) -> Result<Endpoint> {
+    let endpoint = Endpoint::from_shared(endpoint.to_string())?;
+
+    if endpoint.uri().scheme_str() == Some("https") {
+        Ok(endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?)
+    } else {
+        Ok(endpoint)
+    }
 }
 
 pub fn finish_response(json: &Value) -> Result<Option<Value>> {
