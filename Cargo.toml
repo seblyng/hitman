@@ -35,6 +35,12 @@ protox = "0.9"
 http = "1"
 prost = "0.14"
 prost-types = "0.14"
+tower-lsp = "0.20"
+serde = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "hitman-lsp"
+path = "src/hitman_lsp.rs"
 
 [dev-dependencies]
 mktemp = "0.5.1"

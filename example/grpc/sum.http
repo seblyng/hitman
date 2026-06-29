@@ -1,7 +1,7 @@
-GRPC grpcs://grpcb.in:9001/addsvc.Add/Sum
-Proto: ./addsvc.proto
+GRPC {{grpc_url}}/Sum
+Protoset: ./protoset.bin
 
 {
-  "a": 2,
-  "b": 40
+  "a": "0",
+  "b": "0"
 }

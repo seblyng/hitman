@@ -1,8 +1,10 @@
 [default]
+grpc_url = "grpcs://grpcb.in:9001/addsvc.Add"
 base_url = 'https://api.github.com'
 
 [alternative]
 base_url = 'https://api.github.com'
+grpc_url = "grpcs://grpcb.in:9001/addsvc.Add"
 
 [[label]]
 value = "bug"
