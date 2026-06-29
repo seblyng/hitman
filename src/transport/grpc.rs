@@ -10,8 +10,9 @@ use http::uri::PathAndQuery;
 use log::{info, log_enabled, Level};
 use prost::Message;
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, MessageDescriptor, MethodDescriptor,
-    SerializeOptions,
+    Cardinality, DescriptorPool, DynamicMessage, FieldDescriptor, Kind,
+    MessageDescriptor, MethodDescriptor, SerializeOptions,
+    Value as ReflectValue,
 };
 use serde_json::Value;
 use tonic::{
@@ -350,7 +351,9 @@ fn load_method(req: &GrpcRequest) -> Result<MethodDescriptor> {
     Ok(method)
 }
 
-fn load_descriptor_pool(source: &DescriptorSource) -> Result<DescriptorPool> {
+pub fn load_descriptor_pool(
+    source: &DescriptorSource,
+) -> Result<DescriptorPool> {
     let descriptors = match source {
         DescriptorSource::Proto(proto_path) => {
             let import_path = proto_path
@@ -372,11 +375,87 @@ fn load_descriptor_pool(source: &DescriptorSource) -> Result<DescriptorPool> {
     Ok(DescriptorPool::from_file_descriptor_set(descriptors)?)
 }
 
+pub fn list_services(source: &DescriptorSource) -> Result<Vec<String>> {
+    let pool = load_descriptor_pool(source)?;
+    Ok(pool
+        .services()
+        .map(|service| service.full_name().to_string())
+        .collect())
+}
+
+pub fn list_methods(
+    source: &DescriptorSource,
+    service_name: &str,
+) -> Result<Vec<MethodDescriptor>> {
+    let pool = load_descriptor_pool(source)?;
+    let service = pool
+        .get_service_by_name(service_name)
+        .with_context(|| format!("gRPC service not found: {service_name}"))?;
+
+    Ok(service.methods().collect())
+}
+
+pub fn message_template(desc: &MessageDescriptor) -> Result<Value> {
+    let message = build_template_message(desc);
+    serialize_message_with_options(
+        &message,
+        &SerializeOptions::new().skip_default_fields(false),
+    )
+}
+
+fn build_template_message(desc: &MessageDescriptor) -> DynamicMessage {
+    let mut message = DynamicMessage::new(desc.clone());
+
+    for field in desc.fields() {
+        let value = template_field_value(&field);
+        message.set_field(&field, value);
+    }
+
+    message
+}
+
+fn template_field_value(field: &FieldDescriptor) -> ReflectValue {
+    if field.is_map() {
+        return ReflectValue::Map(Default::default());
+    }
+
+    if field.cardinality() == Cardinality::Repeated {
+        return ReflectValue::List(Vec::new());
+    }
+
+    match field.kind() {
+        Kind::Double => ReflectValue::F64(0.0),
+        Kind::Float => ReflectValue::F32(0.0),
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => ReflectValue::I32(0),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => ReflectValue::I64(0),
+        Kind::Uint32 | Kind::Fixed32 => ReflectValue::U32(0),
+        Kind::Uint64 | Kind::Fixed64 => ReflectValue::U64(0),
+        Kind::Bool => ReflectValue::Bool(false),
+        Kind::String => ReflectValue::String(String::new()),
+        Kind::Bytes => ReflectValue::Bytes(Vec::new().into()),
+        Kind::Message(message) => {
+            ReflectValue::Message(build_template_message(&message))
+        }
+        Kind::Enum(en) => ReflectValue::EnumNumber(
+            en.values()
+                .next()
+                .map(|value| value.number())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 fn serialize_message(message: &DynamicMessage) -> Result<Value> {
+    serialize_message_with_options(message, &SerializeOptions::new())
+}
+
+fn serialize_message_with_options(
+    message: &DynamicMessage,
+    options: &SerializeOptions,
+) -> Result<Value> {
     let mut buf = Vec::new();
     let mut serializer = serde_json::Serializer::new(&mut buf);
-    let options = SerializeOptions::new();
-    message.serialize_with_options(&mut serializer, &options)?;
+    message.serialize_with_options(&mut serializer, options)?;
     Ok(serde_json::from_slice(&buf)?)
 }
 
