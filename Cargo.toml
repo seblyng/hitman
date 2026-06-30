@@ -22,6 +22,7 @@ termcolor = "1.4.0"
 thiserror = "2.0.3"
 tokio = { version = "1", features = ["full", "rt"] }
 toml = "0.8"
+toml_edit = "0.22"
 walkdir = "2"
 notify = "7.0.0"
 spinoff = { version = "0.8.0", features = ["dots"] }

@@ -767,6 +767,7 @@ dependencies = [
  "thiserror 2.0.3",
  "tokio",
  "toml",
+ "toml_edit",
  "tonic",
  "tower-lsp",
  "walkdir",
