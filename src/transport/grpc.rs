@@ -420,9 +420,13 @@ fn template_field_value(field: &FieldDescriptor) -> ReflectValue {
     }
 
     if field.cardinality() == Cardinality::Repeated {
-        return ReflectValue::List(Vec::new());
+        return ReflectValue::List(vec![template_singular_field_value(field)]);
     }
 
+    template_singular_field_value(field)
+}
+
+fn template_singular_field_value(field: &FieldDescriptor) -> ReflectValue {
     match field.kind() {
         Kind::Double => ReflectValue::F64(0.0),
         Kind::Float => ReflectValue::F32(0.0),
@@ -601,5 +605,48 @@ Authorization: Bearer abc
         assert_eq!(method.name(), "GetUser");
         assert_eq!(method.input().full_name(), "example.GetUserRequest");
         assert_eq!(method.output().full_name(), "example.GetUserResponse");
+    }
+
+    #[test]
+    fn message_template_includes_example_for_repeated_message_fields() {
+        let tmp = Temp::new_dir().unwrap();
+        let proto = tmp.join("order.proto");
+        fs::write(
+            &proto,
+            r#"
+                syntax = "proto3";
+                package example;
+
+                message CreateOrderRequest {
+                    repeated LineItem items = 1;
+                }
+
+                message LineItem {
+                    string sku = 1;
+                    int32 quantity = 2;
+                }
+            "#,
+        )
+        .unwrap();
+        let descriptors =
+            protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
+        let pool = DescriptorPool::from_file_descriptor_set(descriptors).unwrap();
+        let request = pool
+            .get_message_by_name("example.CreateOrderRequest")
+            .unwrap();
+
+        let template = message_template(&request).unwrap();
+
+        assert_eq!(
+            template,
+            serde_json::json!({
+                "items": [
+                    {
+                        "sku": "",
+                        "quantity": 0,
+                    }
+                ]
+            })
+        );
     }
 }
