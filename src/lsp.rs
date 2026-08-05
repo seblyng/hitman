@@ -17,23 +17,29 @@ use tower_lsp::{
     lsp_types::{
         CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand,
         CodeActionParams, CodeActionProviderCapability, Command,
-        DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams,
-        GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-        HoverProviderCapability, InitializeParams, InitializeResult, Location,
-        MarkedString, MessageType, OneOf, Position, Range, ReferenceParams,
-        ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-        TextEdit, Url, WorkspaceEdit,
+        CompletionItem, CompletionItemKind, CompletionOptions,
+        CompletionTextEdit,
+        CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+        DidOpenTextDocumentParams, ExecuteCommandOptions, ExecuteCommandParams,
+        GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+        HoverParams, HoverProviderCapability, InitializeParams,
+        InitializeResult, InsertTextFormat, Location, MarkedString, MessageType,
+        OneOf, Position, Range, ReferenceParams, ServerCapabilities,
+        TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+        WorkspaceEdit,
     },
     Client, LanguageServer, LspService, Server,
 };
+
+use prost_reflect::{Cardinality, FieldDescriptor, Kind, MessageDescriptor};
 
 use crate::{
     env::get_target,
     resolve::{find_root_dir, resolve_path, Resolved, ResolvedAs},
     scope::Replacement,
     transport::grpc::{
-        list_methods, list_services, message_template, DescriptorSource,
+        list_methods, list_services, load_descriptor_pool, message_template,
+        DescriptorSource,
     },
 };
 
@@ -89,6 +95,12 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "\"".to_string(),
+                    ]),
+                    ..Default::default()
+                }),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
@@ -148,6 +160,27 @@ impl LanguageServer for Backend {
 
         match hover_for_position(&uri, &text, params.position) {
             Ok(hover) => Ok(hover),
+            Err(err) => {
+                self.client
+                    .log_message(MessageType::ERROR, err.to_string())
+                    .await;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> LspResult<Option<CompletionResponse>> {
+        let params = params.text_document_position;
+        let uri = params.text_document.uri;
+        let Some(text) = self.documents.lock().await.get(&uri).cloned() else {
+            return Ok(None);
+        };
+
+        match completion_for_position(&uri, &text, params.position) {
+            Ok(completion) => Ok(completion),
             Err(err) => {
                 self.client
                     .log_message(MessageType::ERROR, err.to_string())
@@ -537,6 +570,606 @@ fn references_for_position(
     locations.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
 
     Ok(Some(locations))
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct JsonCompletionContext {
+    path: Vec<String>,
+    field: Option<String>,
+    existing_fields: Vec<String>,
+    key_start: Option<usize>,
+    value_start: Option<usize>,
+    expecting_key: bool,
+    in_string: bool,
+}
+
+#[derive(Debug)]
+struct JsonFrame {
+    field: Option<String>,
+    kind: JsonFrameKind,
+    fields: Vec<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum JsonFrameKind {
+    Object,
+    Array,
+}
+
+fn completion_for_position(
+    uri: &Url,
+    text: &str,
+    position: Position,
+) -> Result<Option<CompletionResponse>> {
+    let Some(body_start) = body_start_offset(text) else {
+        return Ok(None);
+    };
+    let cursor = position_to_byte_offset(text, position);
+    if cursor < body_start {
+        return Ok(None);
+    }
+
+    let path = uri_to_path(uri)?;
+    let descriptor_source = descriptor_source(&path, text)?;
+    let service_name = proto_service(&path, text, &descriptor_source)?;
+    let method_name = grpc_method_name(text).context("Missing gRPC method")?;
+    let pool = load_descriptor_pool(&descriptor_source)?;
+    let service = pool
+        .get_service_by_name(&service_name)
+        .with_context(|| format!("gRPC service not found: {service_name}"))?;
+    let method = service
+        .methods()
+        .find(|method| method.name() == method_name)
+        .with_context(|| format!("gRPC method not found: {method_name}"))?;
+    let mut context = json_completion_context(&text[body_start..cursor]);
+    context.existing_fields = existing_fields_for_path(
+        &text[body_start..],
+        &context.path,
+    );
+    let Some(message) = message_for_path(method.input(), &context.path) else {
+        return Ok(None);
+    };
+
+    let items = if context.expecting_key {
+        field_completion_items(
+            &message,
+            &context.existing_fields,
+            field_completion_range(
+                text,
+                body_start,
+                cursor,
+                context.key_start,
+            ),
+        )
+    } else if let Some(field_name) = context.field.as_deref() {
+        enum_completion_items(
+            &message,
+            field_name,
+            context.in_string,
+            enum_completion_edit(
+                text,
+                body_start,
+                cursor,
+                context.value_start,
+            ),
+        )
+    } else {
+        Vec::new()
+    };
+
+    if items.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+}
+
+fn field_completion_items(
+    message: &MessageDescriptor,
+    existing_fields: &[String],
+    replacement_range: Range,
+) -> Vec<CompletionItem> {
+    message
+        .fields()
+        .filter(|field| {
+            !existing_fields.iter().any(|existing| {
+                existing == field.json_name() || existing == field.name()
+            })
+        })
+        .map(|field| {
+            let name = field.json_name().to_string();
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(field_type_detail(&field)),
+                filter_text: Some(format!("\"{name}\"")),
+                insert_text: Some(field_completion_text(&field)),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: field_completion_text(&field),
+                })),
+                command: field_completion_command(&field),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn field_completion_range(
+    text: &str,
+    body_start: usize,
+    cursor: usize,
+    key_start: Option<usize>,
+) -> Range {
+    let start = body_start + key_start.unwrap_or(cursor - body_start);
+    let end = if key_start.is_some() && text[cursor..].starts_with('"') {
+        cursor + 1
+    } else {
+        cursor
+    };
+    Range {
+        start: byte_position(text, start),
+        end: byte_position(text, end),
+    }
+}
+
+fn field_completion_text(field: &FieldDescriptor) -> String {
+    let name = field.json_name();
+    format!("\"{name}\": {}", field_value_snippet(field))
+}
+
+fn field_value_snippet(field: &FieldDescriptor) -> &'static str {
+    if field.cardinality() == Cardinality::Repeated {
+        return "[$0]";
+    }
+    if field.is_map() {
+        return "{$0}";
+    }
+
+    match field.kind() {
+        Kind::String | Kind::Enum(_) => "\"$0\"",
+        Kind::Message(_) => "{$0}",
+        _ => "$0",
+    }
+}
+
+fn field_completion_command(field: &FieldDescriptor) -> Option<Command> {
+    if matches!(singular_field_kind(field), Kind::Enum(_)) {
+        Some(Command {
+            title: "Suggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        })
+    } else {
+        None
+    }
+}
+
+fn enum_completion_items(
+    message: &MessageDescriptor,
+    field_name: &str,
+    in_string: bool,
+    edit: Option<(Range, Option<TextEdit>)>,
+) -> Vec<CompletionItem> {
+    let Some(field) = field_by_json_name(message, field_name) else {
+        return Vec::new();
+    };
+    let Kind::Enum(en) = singular_field_kind(&field) else {
+        return Vec::new();
+    };
+
+    en.values()
+        .map(|value| {
+            let name = value.name().to_string();
+            let mut item = CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some(value.number().to_string()),
+                insert_text: Some(if in_string {
+                    format!("{name}$0")
+                } else {
+                    name.clone()
+                }),
+                insert_text_format: Some(if in_string {
+                    InsertTextFormat::SNIPPET
+                } else {
+                    InsertTextFormat::PLAIN_TEXT
+                }),
+                ..Default::default()
+            };
+            if let Some((range, delete_closing_quote)) = edit.clone() {
+                item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: if delete_closing_quote.is_some() {
+                        format!("{name}\"$0")
+                    } else {
+                        format!("{name}$0")
+                    },
+                }));
+                item.additional_text_edits = delete_closing_quote.map(|edit| vec![edit]);
+            }
+            item
+        })
+        .collect()
+}
+
+fn enum_completion_edit(
+    text: &str,
+    body_start: usize,
+    cursor: usize,
+    value_start: Option<usize>,
+) -> Option<(Range, Option<TextEdit>)> {
+    let value_start = value_start?;
+    let start = body_start + value_start;
+    let delete_closing_quote = if text[cursor..].starts_with('"') {
+        Some(TextEdit {
+            range: Range {
+                start: byte_position(text, cursor),
+                end: byte_position(text, cursor + 1),
+            },
+            new_text: String::new(),
+        })
+    } else {
+        None
+    };
+
+    Some((
+        Range {
+            start: byte_position(text, start),
+            end: byte_position(text, cursor),
+        },
+        delete_closing_quote,
+    ))
+}
+
+fn field_type_detail(field: &FieldDescriptor) -> String {
+    if field.is_map() {
+        return "object".to_string();
+    }
+
+    let ty = kind_type_detail(&field.kind());
+    if field.cardinality() == Cardinality::Repeated {
+        format!("array<{ty}>")
+    } else {
+        ty
+    }
+}
+
+fn kind_type_detail(kind: &Kind) -> String {
+    match kind {
+        Kind::Double | Kind::Float => "number".to_string(),
+        Kind::Int32
+        | Kind::Sint32
+        | Kind::Sfixed32
+        | Kind::Int64
+        | Kind::Sint64
+        | Kind::Sfixed64
+        | Kind::Uint32
+        | Kind::Fixed32
+        | Kind::Uint64
+        | Kind::Fixed64 => "integer".to_string(),
+        Kind::Bool => "boolean".to_string(),
+        Kind::String => "string".to_string(),
+        Kind::Bytes => "bytes".to_string(),
+        Kind::Message(message) => message.full_name().to_string(),
+        Kind::Enum(en) => en.full_name().to_string(),
+    }
+}
+
+fn message_for_path(
+    mut message: MessageDescriptor,
+    path: &[String],
+) -> Option<MessageDescriptor> {
+    for field_name in path {
+        let field = field_by_json_name(&message, field_name)?;
+        let Kind::Message(next) = singular_field_kind(&field) else {
+            return None;
+        };
+        message = next;
+    }
+
+    Some(message)
+}
+
+fn field_by_json_name(
+    message: &MessageDescriptor,
+    field_name: &str,
+) -> Option<FieldDescriptor> {
+    message.fields().find(|field| {
+        field.json_name() == field_name || field.name() == field_name
+    })
+}
+
+fn singular_field_kind(field: &FieldDescriptor) -> Kind {
+    if field.is_map() {
+        return field.kind();
+    }
+
+    field.kind()
+}
+
+fn json_completion_context(prefix: &str) -> JsonCompletionContext {
+    let mut frames: Vec<JsonFrame> = Vec::new();
+    let mut pending_field: Option<String> = None;
+    let mut last_string: Option<String> = None;
+    let mut in_string = false;
+    let mut string_is_value = false;
+    let mut string_is_key = false;
+    let mut key_start = None;
+    let mut value_start = None;
+    let mut escape = false;
+    let mut string = String::new();
+    let mut saw_colon_since_string = false;
+    let mut last_non_ws = None;
+
+    for (offset, ch) in prefix.char_indices() {
+        if in_string {
+            if escape {
+                string.push(ch);
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => {
+                    in_string = false;
+                    last_string = Some(std::mem::take(&mut string));
+                    if string_is_value {
+                        pending_field = None;
+                    }
+                    string_is_value = false;
+                    string_is_key = false;
+                    saw_colon_since_string = false;
+                    last_non_ws = Some('"');
+                }
+                _ => string.push(ch),
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                string_is_value = pending_field.is_some()
+                    && matches!(last_non_ws, Some(':') | Some('[') | Some(','));
+                string_is_key = frames
+                    .last()
+                    .is_some_and(|frame| frame.kind == JsonFrameKind::Object)
+                    && pending_field.is_none()
+                    && matches!(last_non_ws, Some('{') | Some(','));
+                if string_is_key {
+                    key_start = Some(offset);
+                }
+                if string_is_value {
+                    value_start = Some(offset + 1);
+                }
+                string.clear();
+                last_non_ws = Some(ch);
+            }
+            ':' => {
+                if let Some(key) = last_string.take() {
+                    if let Some(frame) = frames
+                        .last_mut()
+                        .filter(|frame| frame.kind == JsonFrameKind::Object)
+                    {
+                        frame.fields.push(key.clone());
+                    }
+                    pending_field = Some(key);
+                }
+                saw_colon_since_string = true;
+                last_non_ws = Some(ch);
+            }
+            ',' => {
+                pending_field = None;
+                last_string = None;
+                key_start = None;
+                value_start = None;
+                saw_colon_since_string = false;
+                last_non_ws = Some(ch);
+            }
+            '{' => {
+                let field = pending_field.take().or_else(|| {
+                    frames.last().and_then(|frame| {
+                        (frame.kind == JsonFrameKind::Array)
+                            .then(|| frame.field.clone())
+                            .flatten()
+                    })
+                });
+                frames.push(JsonFrame {
+                    field,
+                    kind: JsonFrameKind::Object,
+                    fields: Vec::new(),
+                });
+                last_string = None;
+                key_start = None;
+                value_start = None;
+                saw_colon_since_string = false;
+                last_non_ws = Some(ch);
+            }
+            '[' => {
+                frames.push(JsonFrame {
+                    field: pending_field.take(),
+                    kind: JsonFrameKind::Array,
+                    fields: Vec::new(),
+                });
+                last_string = None;
+                key_start = None;
+                value_start = None;
+                saw_colon_since_string = false;
+                last_non_ws = Some(ch);
+            }
+            '}' | ']' => {
+                frames.pop();
+                pending_field = None;
+                last_string = None;
+                key_start = None;
+                value_start = None;
+                saw_colon_since_string = false;
+                last_non_ws = Some(ch);
+            }
+            _ => {
+                last_non_ws = Some(ch);
+            }
+        }
+    }
+
+    let path = frames
+        .iter()
+        .filter(|frame| frame.kind == JsonFrameKind::Object)
+        .filter_map(|frame| frame.field.clone())
+        .collect::<Vec<_>>();
+    let in_array_field = frames
+        .last()
+        .and_then(|frame| {
+            (frame.kind == JsonFrameKind::Array).then(|| frame.field.clone())
+        })
+        .flatten();
+    let field = pending_field.clone().or(in_array_field);
+    let current_object = frames
+        .last()
+        .is_some_and(|frame| frame.kind == JsonFrameKind::Object);
+    let existing_fields = frames
+        .last()
+        .filter(|frame| frame.kind == JsonFrameKind::Object)
+        .map(|frame| frame.fields.clone())
+        .unwrap_or_default();
+    let expecting_key = current_object
+        && field.is_none()
+        && if in_string {
+            string_is_key
+        } else {
+            matches!(last_non_ws, Some('{') | Some(','))
+        }
+        && !saw_colon_since_string;
+
+    JsonCompletionContext {
+        path,
+        field,
+        existing_fields,
+        key_start,
+        value_start,
+        expecting_key,
+        in_string,
+    }
+}
+
+fn existing_fields_for_path(body: &str, target_path: &[String]) -> Vec<String> {
+    let mut frames: Vec<JsonFrame> = Vec::new();
+    let mut last_string: Option<String> = None;
+    let mut pending_field: Option<String> = None;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut string = String::new();
+    let mut fields = Vec::new();
+
+    for ch in body.chars() {
+        if in_string {
+            if escape {
+                string.push(ch);
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => {
+                    in_string = false;
+                    last_string = Some(std::mem::take(&mut string));
+                }
+                _ => string.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                string.clear();
+            }
+            ':' => {
+                if let Some(key) = last_string.take() {
+                    if object_path(&frames) == target_path {
+                        fields.push(key.clone());
+                    }
+                    pending_field = Some(key);
+                }
+            }
+            ',' => {
+                last_string = None;
+                pending_field = None;
+            }
+            '{' => {
+                let field = pending_field.take().or_else(|| {
+                    frames.last().and_then(|frame| {
+                        (frame.kind == JsonFrameKind::Array)
+                            .then(|| frame.field.clone())
+                            .flatten()
+                    })
+                });
+                frames.push(JsonFrame {
+                    field,
+                    kind: JsonFrameKind::Object,
+                    fields: Vec::new(),
+                });
+                last_string = None;
+            }
+            '[' => {
+                frames.push(JsonFrame {
+                    field: pending_field.take(),
+                    kind: JsonFrameKind::Array,
+                    fields: Vec::new(),
+                });
+                last_string = None;
+            }
+            '}' | ']' => {
+                frames.pop();
+                last_string = None;
+                pending_field = None;
+            }
+            _ => {}
+        }
+    }
+
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+fn object_path(frames: &[JsonFrame]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|frame| frame.kind == JsonFrameKind::Object)
+        .filter_map(|frame| frame.field.clone())
+        .collect()
+}
+
+fn body_start_offset(text: &str) -> Option<usize> {
+    text.find("\r\n\r\n")
+        .map(|offset| offset + 4)
+        .or_else(|| text.find("\n\n").map(|offset| offset + 2))
+}
+
+fn position_to_byte_offset(text: &str, position: Position) -> usize {
+    let mut line = 0;
+    let mut character = 0;
+
+    for (offset, ch) in text.char_indices() {
+        if line == position.line && character == position.character {
+            return offset;
+        }
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+
+    text.len()
 }
 
 fn variable_definition_locations(
@@ -1054,6 +1687,55 @@ mod tests {
         (tmp, request, text)
     }
 
+    fn grpc_completion_fixture(body: &str) -> (Temp, PathBuf, String) {
+        let tmp = Temp::new_dir().unwrap();
+        fs::write(
+            tmp.join("orders.proto"),
+            r#"
+                syntax = "proto3";
+                package orders;
+
+                service Orders {
+                    rpc Create (CreateOrderRequest) returns (CreateOrderResponse);
+                }
+
+                enum State {
+                    STATE_UNSPECIFIED = 0;
+                    ACTIVE = 1;
+                    DISABLED = 2;
+                }
+
+                message CreateOrderRequest {
+                    string user_id = 1;
+                    State state = 2;
+                    Nested nested = 3;
+                    repeated State states = 4;
+                }
+
+                message Nested {
+                    State state = 1;
+                    string note = 2;
+                }
+
+                message CreateOrderResponse { string id = 1; }
+            "#,
+        )
+        .unwrap();
+        let descriptors =
+            protox::compile([tmp.join("orders.proto")], [tmp.as_path()])
+                .unwrap();
+        fs::write(tmp.join("protoset.bin"), descriptors.encode_to_vec())
+            .unwrap();
+
+        let request = tmp.join("create.http");
+        let text = format!(
+            "GRPC localhost:50051/orders.Orders/Create\nProtoset: ./protoset.bin\n\n{body}"
+        );
+        fs::write(&request, &text).unwrap();
+
+        (tmp, request, text)
+    }
+
     fn variable_fixture() -> (Temp, PathBuf, String) {
         let tmp = Temp::new_dir().unwrap();
         fs::write(
@@ -1248,6 +1930,319 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn completion_offers_grpc_body_fields() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let labels =
+            items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["userId", "state", "nested", "states"]);
+    }
+
+    #[test]
+    fn completion_omits_existing_grpc_body_fields() {
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"state\": \"ACTIVE\",\n  \n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(5, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let labels =
+            items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["userId", "nested", "states"]);
+    }
+
+    #[test]
+    fn completion_omits_existing_grpc_body_fields_below_cursor() {
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \n  \"state\": \"ACTIVE\"\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let labels =
+            items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["userId", "nested", "states"]);
+    }
+
+    #[test]
+    fn completion_shows_repeated_grpc_body_fields_as_arrays() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let states = items
+            .into_iter()
+            .find(|item| item.label == "states")
+            .unwrap();
+
+        assert_eq!(states.detail.as_deref(), Some("array<orders.State>"));
+        assert_eq!(states.insert_text.as_deref(), Some("\"states\": [$0]"));
+    }
+
+    #[test]
+    fn completion_inserts_grpc_body_field_name_inside_key_string() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \"user\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 7))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let user_id = items
+            .into_iter()
+            .find(|item| item.label == "userId")
+            .unwrap();
+
+        assert_eq!(user_id.filter_text.as_deref(), Some("\"userId\""));
+        assert_eq!(user_id.insert_text.as_deref(), Some("\"userId\": \"$0\""));
+        assert_eq!(
+            user_id.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
+        );
+        let Some(CompletionTextEdit::Edit(edit)) = user_id.text_edit else {
+            panic!("expected completion text edit");
+        };
+        assert_eq!(edit.range.start, Position::new(4, 2));
+        assert_eq!(edit.range.end, Position::new(4, 7));
+        assert_eq!(edit.new_text, "\"userId\": \"$0\"");
+    }
+
+    #[test]
+    fn completion_replaces_auto_paired_key_quote() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \"user\"\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 7))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let user_id = items
+            .into_iter()
+            .find(|item| item.label == "userId")
+            .unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = user_id.text_edit else {
+            panic!("expected completion text edit");
+        };
+
+        assert_eq!(edit.range.start, Position::new(4, 2));
+        assert_eq!(edit.range.end, Position::new(4, 8));
+        assert_eq!(edit.new_text, "\"userId\": \"$0\"");
+    }
+
+    #[test]
+    fn completion_acceptance_opens_grpc_string_field_value_quote() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let user_id = items
+            .into_iter()
+            .find(|item| item.label == "userId")
+            .unwrap();
+
+        assert_eq!(user_id.label, "userId");
+        assert_eq!(user_id.filter_text.as_deref(), Some("\"userId\""));
+        assert_eq!(user_id.insert_text.as_deref(), Some("\"userId\": \"$0\""));
+        assert_eq!(
+            user_id.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
+        );
+        let Some(CompletionTextEdit::Edit(edit)) = user_id.text_edit else {
+            panic!("expected completion text edit");
+        };
+        assert_eq!(edit.range.start, Position::new(4, 2));
+        assert_eq!(edit.range.end, Position::new(4, 2));
+        assert_eq!(edit.new_text, "\"userId\": \"$0\"");
+    }
+
+    #[test]
+    fn completion_retriggers_after_grpc_enum_field_acceptance() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let mut items = items.into_iter();
+        let state = items.find(|item| item.label == "state").unwrap();
+
+        let command = state.command.unwrap();
+        assert_eq!(command.title, "Suggest");
+        assert_eq!(command.command, "editor.action.triggerSuggest");
+    }
+
+    #[test]
+    fn completion_does_not_retrigger_after_grpc_string_field_acceptance() {
+        let (_tmp, request, text) = grpc_completion_fixture("{\n  \n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(4, 2))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let mut items = items.into_iter();
+        let user_id = items.find(|item| item.label == "userId").unwrap();
+
+        assert!(user_id.command.is_none());
+    }
+
+    #[test]
+    fn completion_offers_grpc_enum_variants() {
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"state\": \"\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(3, 12))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let labels =
+            items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["STATE_UNSPECIFIED", "ACTIVE", "DISABLED"]);
+    }
+
+    #[test]
+    fn completion_moves_cursor_after_grpc_enum_variant_without_comma() {
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"state\": \"\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(3, 12))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let active = items
+            .into_iter()
+            .find(|item| item.label == "ACTIVE")
+            .unwrap();
+
+        assert_eq!(active.insert_text.as_deref(), Some("ACTIVE$0"));
+        assert_eq!(
+            active.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
+        );
+    }
+
+    #[test]
+    fn completion_moves_cursor_after_grpc_enum_value_closing_quote() {
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"state\": \"\"\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+        let cursor = byte_position(
+            &text,
+            text.find("\"state\": \"").unwrap() + "\"state\": \"".len(),
+        );
+
+        let completion = completion_for_position(&uri, &text, cursor)
+            .unwrap()
+            .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let active = items
+            .into_iter()
+            .find(|item| item.label == "ACTIVE")
+            .unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = active.text_edit else {
+            panic!("expected completion text edit");
+        };
+
+        assert_eq!(edit.range.start, cursor);
+        assert_eq!(edit.range.end, cursor);
+        assert_eq!(edit.new_text, "ACTIVE\"$0");
+        let additional = active.additional_text_edits.unwrap();
+        assert_eq!(additional.len(), 1);
+        assert_eq!(additional[0].range.start, cursor);
+        assert_eq!(additional[0].range.end.character, cursor.character + 1);
+        assert_eq!(additional[0].new_text, "");
+    }
+
+    #[test]
+    fn completion_does_not_offer_enum_variants_after_completed_value() {
+        let (_tmp, request, text) = grpc_completion_fixture(
+            "{\n  \"state\": \"ACTIVE\"\n  \"\n}\n",
+        );
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(5, 3)).unwrap();
+
+        assert!(completion.is_none());
+    }
+
+    #[test]
+    fn completion_follows_nested_grpc_messages() {
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"nested\": {\n    \n  }\n}\n");
+        let uri = Url::from_file_path(request).unwrap();
+
+        let completion =
+            completion_for_position(&uri, &text, Position::new(5, 4))
+                .unwrap()
+                .unwrap();
+        let CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        let labels =
+            items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["state", "note"]);
     }
 
     #[test]
