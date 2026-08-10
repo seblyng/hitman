@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     path::{Component, PathBuf},
     str::FromStr,
@@ -14,6 +15,7 @@ use prost_reflect::{
     MessageDescriptor, MethodDescriptor, SerializeOptions,
     Value as ReflectValue,
 };
+use serde::Serialize;
 use serde_json::Value;
 use tonic::{
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
@@ -396,37 +398,151 @@ pub fn list_methods(
 }
 
 pub fn message_template(desc: &MessageDescriptor) -> Result<Value> {
-    let message = build_template_message(desc);
+    let message = build_template_message(desc, &HashMap::new());
     serialize_message_with_options(
         &message,
         &SerializeOptions::new().skip_default_fields(false),
     )
 }
 
-fn build_template_message(desc: &MessageDescriptor) -> DynamicMessage {
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MessageTemplateChoice {
+    pub oneof: String,
+    pub oneof_label: String,
+    pub field: String,
+    pub field_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MessageTemplateChoiceGroup {
+    pub oneof: String,
+    pub oneof_label: String,
+    pub options: Vec<MessageTemplateChoice>,
+}
+
+pub fn next_message_template_choice(
+    desc: &MessageDescriptor,
+    choices: &HashMap<String, String>,
+) -> Option<MessageTemplateChoiceGroup> {
+    next_template_choice(desc, choices)
+}
+
+pub fn message_template_with_choices(
+    desc: &MessageDescriptor,
+    choices: &HashMap<String, String>,
+) -> Result<Value> {
+    let message = build_template_message(desc, choices);
+    serialize_message_with_options(
+        &message,
+        &SerializeOptions::new().skip_default_fields(false),
+    )
+}
+
+fn build_template_message(
+    desc: &MessageDescriptor,
+    choices: &HashMap<String, String>,
+) -> DynamicMessage {
     let mut message = DynamicMessage::new(desc.clone());
 
     for field in desc.fields() {
-        let value = template_field_value(&field);
+        if !should_include_template_field(&field, choices) {
+            continue;
+        }
+        let value = template_field_value(&field, choices);
         message.set_field(&field, value);
     }
 
     message
 }
 
-fn template_field_value(field: &FieldDescriptor) -> ReflectValue {
+fn should_include_template_field(
+    field: &FieldDescriptor,
+    choices: &HashMap<String, String>,
+) -> bool {
+    let Some(oneof) = field.containing_oneof() else {
+        return true;
+    };
+    if oneof.is_synthetic() {
+        return true;
+    }
+
+    let selected = choices.get(oneof.full_name()).cloned().or_else(|| {
+        oneof.fields().next().map(|field| field.name().to_string())
+    });
+
+    selected.as_deref() == Some(field.name())
+}
+
+fn next_template_choice(
+    desc: &MessageDescriptor,
+    choices: &HashMap<String, String>,
+) -> Option<MessageTemplateChoiceGroup> {
+    let mut seen_oneofs = Vec::new();
+
+    for field in desc.fields() {
+        if let Some(oneof) = field.containing_oneof() {
+            if oneof.is_synthetic()
+                || seen_oneofs.iter().any(|seen| seen == oneof.full_name())
+            {
+                continue;
+            }
+            seen_oneofs.push(oneof.full_name().to_string());
+
+            if oneof.fields().len() > 1
+                && !choices.contains_key(oneof.full_name())
+            {
+                return Some(MessageTemplateChoiceGroup {
+                    oneof: oneof.full_name().to_string(),
+                    oneof_label: oneof.name().to_string(),
+                    options: oneof
+                        .fields()
+                        .map(|field| MessageTemplateChoice {
+                            oneof: oneof.full_name().to_string(),
+                            oneof_label: oneof.name().to_string(),
+                            field: field.name().to_string(),
+                            field_label: field.json_name().to_string(),
+                        })
+                        .collect(),
+                });
+            }
+
+            if !should_include_template_field(&field, choices) {
+                continue;
+            }
+        }
+
+        let Kind::Message(message) = field.kind() else {
+            continue;
+        };
+        if let Some(choice) = next_template_choice(&message, choices) {
+            return Some(choice);
+        }
+    }
+
+    None
+}
+
+fn template_field_value(
+    field: &FieldDescriptor,
+    choices: &HashMap<String, String>,
+) -> ReflectValue {
     if field.is_map() {
         return ReflectValue::Map(Default::default());
     }
 
     if field.cardinality() == Cardinality::Repeated {
-        return ReflectValue::List(vec![template_singular_field_value(field)]);
+        return ReflectValue::List(vec![template_singular_field_value(
+            field, choices,
+        )]);
     }
 
-    template_singular_field_value(field)
+    template_singular_field_value(field, choices)
 }
 
-fn template_singular_field_value(field: &FieldDescriptor) -> ReflectValue {
+fn template_singular_field_value(
+    field: &FieldDescriptor,
+    choices: &HashMap<String, String>,
+) -> ReflectValue {
     match field.kind() {
         Kind::Double => ReflectValue::F64(0.0),
         Kind::Float => ReflectValue::F32(0.0),
@@ -438,7 +554,7 @@ fn template_singular_field_value(field: &FieldDescriptor) -> ReflectValue {
         Kind::String => ReflectValue::String(String::new()),
         Kind::Bytes => ReflectValue::Bytes(Vec::new().into()),
         Kind::Message(message) => {
-            ReflectValue::Message(build_template_message(&message))
+            ReflectValue::Message(build_template_message(&message, choices))
         }
         Kind::Enum(en) => ReflectValue::EnumNumber(
             en.values()
@@ -630,7 +746,8 @@ Authorization: Bearer abc
         .unwrap();
         let descriptors =
             protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
-        let pool = DescriptorPool::from_file_descriptor_set(descriptors).unwrap();
+        let pool =
+            DescriptorPool::from_file_descriptor_set(descriptors).unwrap();
         let request = pool
             .get_message_by_name("example.CreateOrderRequest")
             .unwrap();
