@@ -18,15 +18,14 @@ use tower_lsp::{
         CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand,
         CodeActionParams, CodeActionProviderCapability, Command,
         CompletionItem, CompletionItemKind, CompletionOptions,
-        CompletionTextEdit,
-        CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-        DidOpenTextDocumentParams, ExecuteCommandOptions, ExecuteCommandParams,
-        GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-        HoverParams, HoverProviderCapability, InitializeParams,
-        InitializeResult, InsertTextFormat, Location, MarkedString, MessageType,
-        OneOf, Position, Range, ReferenceParams, ServerCapabilities,
-        TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
-        WorkspaceEdit,
+        CompletionParams, CompletionResponse, CompletionTextEdit,
+        DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+        ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams,
+        GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+        HoverProviderCapability, InitializeParams, InitializeResult,
+        InsertTextFormat, Location, MarkedString, MessageType, OneOf, Position,
+        Range, ReferenceParams, ServerCapabilities, TextDocumentSyncCapability,
+        TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit,
     },
     Client, LanguageServer, LspService, Server,
 };
@@ -39,12 +38,13 @@ use crate::{
     scope::Replacement,
     transport::grpc::{
         list_methods, list_services, load_descriptor_pool, message_template,
-        DescriptorSource,
+        message_template_with_choices, next_message_template_choice,
+        DescriptorSource, MessageTemplateChoiceGroup,
     },
 };
 
-const GENERATE_TEMPLATE: &str = "hitman.generateMessageTemplate";
 const LIST_GRPC_METHODS: &str = "hitman.listGrpcMethods";
+const NEXT_TEMPLATE_CHOICE: &str = "hitman.nextMessageTemplateChoice";
 const SET_GRPC_METHOD: &str = "hitman.setGrpcMethod";
 const SELECT_GRPC_METHOD: &str = "hitman.selectGrpcMethod";
 const CONFIG_FILE: &str = "hitman.toml";
@@ -88,17 +88,15 @@ impl LanguageServer for Backend {
                 ),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
-                        GENERATE_TEMPLATE.to_string(),
                         LIST_GRPC_METHODS.to_string(),
+                        NEXT_TEMPLATE_CHOICE.to_string(),
                         SET_GRPC_METHOD.to_string(),
                     ],
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        "\"".to_string(),
-                    ]),
+                    trigger_characters: Some(vec!["\"".to_string()]),
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
@@ -269,14 +267,17 @@ impl LanguageServer for Backend {
                     }
                 }
             }
-            GENERATE_TEMPLATE => {
-                let Ok(GenerateTemplateArgs { uri, method }) =
-                    parse_command_args(params.arguments)
+            NEXT_TEMPLATE_CHOICE => {
+                let Ok(NextTemplateChoiceArgs {
+                    uri,
+                    method,
+                    oneofs,
+                }) = parse_command_args(params.arguments)
                 else {
                     self.client
                         .log_message(
                             MessageType::ERROR,
-                            "Invalid hitman.generateMessageTemplate arguments",
+                            "Invalid hitman.nextMessageTemplateChoice arguments",
                         )
                         .await;
                     return Ok(None);
@@ -287,35 +288,27 @@ impl LanguageServer for Backend {
                     return Ok(None);
                 };
 
-                match template_edit(&uri, &text, &method) {
-                    Ok(edit) => {
-                        let applied = self
-                            .client
-                            .apply_edit(edit)
-                            .await
-                            .map(|response| response.applied)
-                            .unwrap_or(false);
-                        if !applied {
-                            self.client
-                                .show_message(
-                                    MessageType::ERROR,
-                                    "Editor rejected hitman template edit",
-                                )
-                                .await;
-                        }
-                    }
+                match template_choice_for_method(
+                    &uri,
+                    &text,
+                    &method,
+                    &oneof_selection_map(&oneofs),
+                ) {
+                    Ok(choice) => Ok(serde_json::to_value(choice).ok()),
                     Err(err) => {
                         self.client
                             .show_message(MessageType::ERROR, err.to_string())
                             .await;
+                        Ok(None)
                     }
                 }
-
-                Ok(None)
             }
             SET_GRPC_METHOD => {
-                let Ok(SetGrpcMethodArgs { uri, method }) =
-                    parse_command_args(params.arguments)
+                let Ok(SetGrpcMethodArgs {
+                    uri,
+                    method,
+                    oneofs,
+                }) = parse_command_args(params.arguments)
                 else {
                     self.client
                         .log_message(
@@ -331,7 +324,7 @@ impl LanguageServer for Backend {
                     return Ok(None);
                 };
 
-                match set_grpc_method_edit(&uri, &text, &method) {
+                match set_grpc_method_edit(&uri, &text, &method, &oneofs) {
                     Ok(edit) => {
                         let applied = self
                             .client
@@ -363,15 +356,25 @@ impl LanguageServer for Backend {
 }
 
 #[derive(Serialize, Deserialize)]
-struct GenerateTemplateArgs {
+struct NextTemplateChoiceArgs {
     uri: Url,
     method: String,
+    #[serde(default)]
+    oneofs: Vec<GenerateTemplateOneofArgs>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GenerateTemplateOneofArgs {
+    oneof: String,
+    field: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SetGrpcMethodArgs {
     uri: Url,
     method: String,
+    #[serde(default)]
+    oneofs: Vec<GenerateTemplateOneofArgs>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -432,20 +435,7 @@ fn code_actions_for_document(
         if let Some(method) =
             methods.iter().find(|method| method.label == current_method)
         {
-            let title = "Generate message template".to_string();
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: title.clone(),
-                kind: Some(CodeActionKind::REFACTOR),
-                command: Some(Command {
-                    title,
-                    command: GENERATE_TEMPLATE.to_string(),
-                    arguments: Some(vec![serde_json::json!({
-                        "uri": uri,
-                        "method": method.method,
-                    })]),
-                }),
-                ..Default::default()
-            }));
+            actions.push(generate_template_code_action(uri, &method.method));
         }
     }
 
@@ -465,6 +455,45 @@ fn code_actions_for_document(
     }));
 
     Ok(actions)
+}
+
+fn generate_template_code_action(
+    uri: &Url,
+    method: &str,
+) -> CodeActionOrCommand {
+    let title = "Generate message template".to_string();
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title: title.clone(),
+        kind: Some(CodeActionKind::REFACTOR),
+        command: Some(Command {
+            title,
+            command: SET_GRPC_METHOD.to_string(),
+            arguments: Some(vec![serde_json::json!({
+                "uri": uri,
+                "method": method,
+            })]),
+        }),
+        ..Default::default()
+    })
+}
+
+fn template_choice_for_method(
+    uri: &Url,
+    text: &str,
+    full_method: &str,
+    choices: &HashMap<String, String>,
+) -> Result<Option<MessageTemplateChoiceGroup>> {
+    let path = uri_to_path(uri)?;
+    let descriptor_source = descriptor_source(&path, text)?;
+    let (service, method_name) = full_method
+        .rsplit_once('.')
+        .context("Invalid gRPC method")?;
+    let method = list_methods(&descriptor_source, service)?
+        .into_iter()
+        .find(|method| method.name() == method_name)
+        .with_context(|| format!("gRPC method not found: {full_method}"))?;
+
+    Ok(next_message_template_choice(&method.input(), choices))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -622,10 +651,8 @@ fn completion_for_position(
         .find(|method| method.name() == method_name)
         .with_context(|| format!("gRPC method not found: {method_name}"))?;
     let mut context = json_completion_context(&text[body_start..cursor]);
-    context.existing_fields = existing_fields_for_path(
-        &text[body_start..],
-        &context.path,
-    );
+    context.existing_fields =
+        existing_fields_for_path(&text[body_start..], &context.path);
     let Some(message) = message_for_path(method.input(), &context.path) else {
         return Ok(None);
     };
@@ -634,24 +661,14 @@ fn completion_for_position(
         field_completion_items(
             &message,
             &context.existing_fields,
-            field_completion_range(
-                text,
-                body_start,
-                cursor,
-                context.key_start,
-            ),
+            field_completion_range(text, body_start, cursor, context.key_start),
         )
     } else if let Some(field_name) = context.field.as_deref() {
         enum_completion_items(
             &message,
             field_name,
             context.in_string,
-            enum_completion_edit(
-                text,
-                body_start,
-                cursor,
-                context.value_start,
-            ),
+            enum_completion_edit(text, body_start, cursor, context.value_start),
         )
     } else {
         Vec::new()
@@ -787,7 +804,8 @@ fn enum_completion_items(
                         format!("{name}$0")
                     },
                 }));
-                item.additional_text_edits = delete_closing_quote.map(|edit| vec![edit]);
+                item.additional_text_edits =
+                    delete_closing_quote.map(|edit| vec![edit]);
             }
             item
         })
@@ -1421,39 +1439,20 @@ fn toml_value_display(value: &TomlValue) -> String {
     }
 }
 
-fn template_edit(
-    uri: &Url,
-    text: &str,
-    full_method: &str,
-) -> Result<WorkspaceEdit> {
-    let path = uri_to_path(uri)?;
-    let descriptor_source = descriptor_source(&path, text)?;
-    let (service, method_name) = full_method
-        .rsplit_once('.')
-        .context("Invalid gRPC method")?;
-    let method = list_methods(&descriptor_source, service)?
-        .into_iter()
-        .find(|method| method.name() == method_name)
-        .with_context(|| format!("gRPC method not found: {full_method}"))?;
-    let json = message_template(&method.input())?;
-    let body = replacement_text(text, &serde_json::to_string_pretty(&json)?);
-    let edit = TextEdit {
-        range: replacement_range(text),
-        new_text: body,
-    };
-    let mut changes = HashMap::new();
-    changes.insert(uri.clone(), vec![edit]);
-
-    Ok(WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    })
+fn oneof_selection_map(
+    oneofs: &[GenerateTemplateOneofArgs],
+) -> HashMap<String, String> {
+    oneofs
+        .iter()
+        .map(|oneof| (oneof.oneof.clone(), oneof.field.clone()))
+        .collect()
 }
 
 fn set_grpc_method_edit(
     uri: &Url,
     text: &str,
     full_method: &str,
+    oneofs: &[GenerateTemplateOneofArgs],
 ) -> Result<WorkspaceEdit> {
     let path = uri_to_path(uri)?;
     let descriptor_source = descriptor_source(&path, text)?;
@@ -1479,7 +1478,14 @@ fn set_grpc_method_edit(
         },
         new_text: new_line,
     };
-    let json = message_template(&method.input())?;
+    let json = if oneofs.is_empty() {
+        message_template(&method.input())?
+    } else {
+        message_template_with_choices(
+            &method.input(),
+            &oneof_selection_map(oneofs),
+        )?
+    };
     let body_edit = TextEdit {
         range: replacement_range(text),
         new_text: replacement_text(text, &serde_json::to_string_pretty(&json)?),
@@ -1736,6 +1742,53 @@ mod tests {
         (tmp, request, text)
     }
 
+    fn grpc_oneof_fixture() -> (Temp, PathBuf, String) {
+        let tmp = Temp::new_dir().unwrap();
+        fs::write(
+            tmp.join("petstore.proto"),
+            r#"
+                syntax = "proto3";
+                package petstore;
+
+                service Pets {
+                    rpc Adopt (AdoptRequest) returns (AdoptResponse);
+                }
+
+                message AdoptRequest {
+                    oneof pet {
+                        Cat cat = 1;
+                        Dog dog = 2;
+                    }
+                }
+
+                message Cat {
+                    string name = 1;
+                    oneof toy {
+                        Ball ball = 2;
+                        Mouse mouse = 3;
+                    }
+                }
+
+                message Ball { string color = 1; }
+                message Mouse { string material = 1; }
+                message Dog { string name = 1; }
+                message AdoptResponse { string id = 1; }
+            "#,
+        )
+        .unwrap();
+        let descriptors =
+            protox::compile([tmp.join("petstore.proto")], [tmp.as_path()])
+                .unwrap();
+        fs::write(tmp.join("protoset.bin"), descriptors.encode_to_vec())
+            .unwrap();
+
+        let request = tmp.join("adopt.http");
+        let text = "GRPC localhost:50051/petstore.Pets/Adopt\nProtoset: ./protoset.bin\n\n{}\n".to_string();
+        fs::write(&request, &text).unwrap();
+
+        (tmp, request, text)
+    }
+
     fn variable_fixture() -> (Temp, PathBuf, String) {
         let tmp = Temp::new_dir().unwrap();
         fs::write(
@@ -1778,7 +1831,7 @@ mod tests {
         assert_eq!(action.title, "Generate message template");
         assert_eq!(
             action.command.as_ref().unwrap().command,
-            "hitman.generateMessageTemplate"
+            "hitman.setGrpcMethod"
         );
         let CodeActionOrCommand::CodeAction(action) = &actions[1] else {
             panic!("expected code action");
@@ -1831,9 +1884,10 @@ mod tests {
         let (_tmp, request, text) = grpc_fixture();
         let uri = Url::from_file_path(request).unwrap();
 
-        let edit = template_edit(&uri, &text, "addsvc.Add.Sum").unwrap();
+        let edit =
+            set_grpc_method_edit(&uri, &text, "addsvc.Add.Sum", &[]).unwrap();
         let changes = edit.changes.unwrap();
-        let edit = &changes[&uri][0];
+        let edit = &changes[&uri][1];
 
         assert_eq!(edit.range.start.line, 3);
         assert_eq!(edit.new_text, "{\n  \"a\": 0,\n  \"b\": 0\n}");
@@ -1847,12 +1901,174 @@ mod tests {
         fs::write(&request, text).unwrap();
         let uri = Url::from_file_path(request).unwrap();
 
-        let edit = template_edit(&uri, text, "addsvc.Add.Sum").unwrap();
+        let edit =
+            set_grpc_method_edit(&uri, text, "addsvc.Add.Sum", &[]).unwrap();
         let changes = edit.changes.unwrap();
-        let edit = &changes[&uri][0];
+        let edit = &changes[&uri][1];
 
         assert_eq!(edit.range.start.line, 2);
         assert_eq!(edit.new_text, "\n{\n  \"a\": 0,\n  \"b\": 0\n}");
+    }
+
+    #[test]
+    fn offers_single_message_template_action_for_oneof_choices() {
+        let (_tmp, request, text) = grpc_oneof_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+
+        let actions = code_actions_for_document(&uri, &text).unwrap();
+
+        assert_eq!(actions.len(), 2);
+        let titles: Vec<_> = actions
+            .iter()
+            .map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => {
+                    action.title.as_str()
+                }
+                CodeActionOrCommand::Command(_) => {
+                    panic!("expected code action")
+                }
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Generate message template", "Select gRPC method"]
+        );
+
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+        let args =
+            &action.command.as_ref().unwrap().arguments.as_ref().unwrap()[0];
+        assert_eq!(
+            action.command.as_ref().unwrap().command,
+            "hitman.setGrpcMethod"
+        );
+        assert_eq!(args["method"], "petstore.Pets.Adopt");
+        assert!(args.get("oneofs").is_none());
+    }
+
+    #[test]
+    fn finds_next_message_template_oneof_choice() {
+        let (_tmp, request, text) = grpc_oneof_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+
+        let choice = template_choice_for_method(
+            &uri,
+            &text,
+            "petstore.Pets.Adopt",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(choice.oneof, "petstore.AdoptRequest.pet");
+        assert_eq!(choice.oneof_label, "pet");
+        assert_eq!(choice.options.len(), 2);
+        assert_eq!(choice.options[0].field_label, "cat");
+        assert_eq!(choice.options[1].field_label, "dog");
+    }
+
+    #[test]
+    fn finds_nested_message_template_oneof_choice_after_parent_selection() {
+        let (_tmp, request, text) = grpc_oneof_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        let selections = HashMap::from([(
+            "petstore.AdoptRequest.pet".to_string(),
+            "cat".to_string(),
+        )]);
+
+        let choice = template_choice_for_method(
+            &uri,
+            &text,
+            "petstore.Pets.Adopt",
+            &selections,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(choice.oneof, "petstore.Cat.toy");
+        assert_eq!(choice.oneof_label, "toy");
+        assert_eq!(choice.options.len(), 2);
+        assert_eq!(choice.options[0].field_label, "ball");
+        assert_eq!(choice.options[1].field_label, "mouse");
+    }
+
+    #[test]
+    fn creates_message_template_for_selected_oneof_choice() {
+        let (_tmp, request, text) = grpc_oneof_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+
+        let edit = set_grpc_method_edit(
+            &uri,
+            &text,
+            "petstore.Pets.Adopt",
+            &[GenerateTemplateOneofArgs {
+                oneof: "petstore.AdoptRequest.pet".to_string(),
+                field: "dog".to_string(),
+            }],
+        )
+        .unwrap();
+        let changes = edit.changes.unwrap();
+        let edit = &changes[&uri][1];
+
+        assert_eq!(
+            edit.new_text,
+            "{\n  \"dog\": {\n    \"name\": \"\"\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn creates_message_template_for_nested_oneof_choice() {
+        let (_tmp, request, text) = grpc_oneof_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+
+        let edit = set_grpc_method_edit(
+            &uri,
+            &text,
+            "petstore.Pets.Adopt",
+            &[
+                GenerateTemplateOneofArgs {
+                    oneof: "petstore.AdoptRequest.pet".to_string(),
+                    field: "cat".to_string(),
+                },
+                GenerateTemplateOneofArgs {
+                    oneof: "petstore.Cat.toy".to_string(),
+                    field: "ball".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        let changes = edit.changes.unwrap();
+        let edit = &changes[&uri][1];
+
+        assert_eq!(
+            edit.new_text,
+            "{\n  \"cat\": {\n    \"ball\": {\n      \"color\": \"\"\n    },\n    \"name\": \"\"\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn set_grpc_method_uses_selected_oneof_choice_for_body() {
+        let (_tmp, request, text) = grpc_oneof_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+
+        let edit = set_grpc_method_edit(
+            &uri,
+            &text,
+            "petstore.Pets.Adopt",
+            &[GenerateTemplateOneofArgs {
+                oneof: "petstore.AdoptRequest.pet".to_string(),
+                field: "dog".to_string(),
+            }],
+        )
+        .unwrap();
+        let changes = edit.changes.unwrap();
+        let body_edit = &changes[&uri][1];
+
+        assert_eq!(
+            body_edit.new_text,
+            "{\n  \"dog\": {\n    \"name\": \"\"\n  }\n}"
+        );
     }
 
     #[test]
@@ -1860,8 +2076,8 @@ mod tests {
         let (_tmp, request, text) = grpc_fixture();
         let uri = Url::from_file_path(request).unwrap();
 
-        let edit =
-            set_grpc_method_edit(&uri, &text, "addsvc.Add.Concat").unwrap();
+        let edit = set_grpc_method_edit(&uri, &text, "addsvc.Add.Concat", &[])
+            .unwrap();
         let changes = edit.changes.unwrap();
         let method_edit = &changes[&uri][0];
         let body_edit = &changes[&uri][1];
@@ -1883,7 +2099,7 @@ mod tests {
         let uri = Url::from_file_path(request).unwrap();
 
         let edit =
-            set_grpc_method_edit(&uri, text, "addsvc.Add.Concat").unwrap();
+            set_grpc_method_edit(&uri, text, "addsvc.Add.Concat", &[]).unwrap();
         let changes = edit.changes.unwrap();
         let method_edit = &changes[&uri][0];
         let body_edit = &changes[&uri][1];
@@ -1899,7 +2115,7 @@ mod tests {
     fn parses_execute_command_arguments() {
         let uri = Url::parse("file:///tmp/sum.http").unwrap();
 
-        let args: GenerateTemplateArgs =
+        let args: SetGrpcMethodArgs =
             parse_command_args(vec![serde_json::json!({
                 "uri": uri,
                 "method": "addsvc.Add.Sum",
@@ -1908,6 +2124,7 @@ mod tests {
 
         assert_eq!(args.uri, Url::parse("file:///tmp/sum.http").unwrap());
         assert_eq!(args.method, "addsvc.Add.Sum");
+        assert!(args.oneofs.is_empty());
     }
 
     #[test]
@@ -2028,10 +2245,7 @@ mod tests {
 
         assert_eq!(user_id.filter_text.as_deref(), Some("\"userId\""));
         assert_eq!(user_id.insert_text.as_deref(), Some("\"userId\": \"$0\""));
-        assert_eq!(
-            user_id.insert_text_format,
-            Some(InsertTextFormat::SNIPPET)
-        );
+        assert_eq!(user_id.insert_text_format, Some(InsertTextFormat::SNIPPET));
         let Some(CompletionTextEdit::Edit(edit)) = user_id.text_edit else {
             panic!("expected completion text edit");
         };
@@ -2042,7 +2256,8 @@ mod tests {
 
     #[test]
     fn completion_replaces_auto_paired_key_quote() {
-        let (_tmp, request, text) = grpc_completion_fixture("{\n  \"user\"\n}\n");
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"user\"\n}\n");
         let uri = Url::from_file_path(request).unwrap();
 
         let completion =
@@ -2085,10 +2300,7 @@ mod tests {
         assert_eq!(user_id.label, "userId");
         assert_eq!(user_id.filter_text.as_deref(), Some("\"userId\""));
         assert_eq!(user_id.insert_text.as_deref(), Some("\"userId\": \"$0\""));
-        assert_eq!(
-            user_id.insert_text_format,
-            Some(InsertTextFormat::SNIPPET)
-        );
+        assert_eq!(user_id.insert_text_format, Some(InsertTextFormat::SNIPPET));
         let Some(CompletionTextEdit::Edit(edit)) = user_id.text_edit else {
             panic!("expected completion text edit");
         };
@@ -2173,10 +2385,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(active.insert_text.as_deref(), Some("ACTIVE$0"));
-        assert_eq!(
-            active.insert_text_format,
-            Some(InsertTextFormat::SNIPPET)
-        );
+        assert_eq!(active.insert_text_format, Some(InsertTextFormat::SNIPPET));
     }
 
     #[test]
@@ -2215,9 +2424,8 @@ mod tests {
 
     #[test]
     fn completion_does_not_offer_enum_variants_after_completed_value() {
-        let (_tmp, request, text) = grpc_completion_fixture(
-            "{\n  \"state\": \"ACTIVE\"\n  \"\n}\n",
-        );
+        let (_tmp, request, text) =
+            grpc_completion_fixture("{\n  \"state\": \"ACTIVE\"\n  \"\n}\n");
         let uri = Url::from_file_path(request).unwrap();
 
         let completion =
