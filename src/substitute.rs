@@ -1,8 +1,17 @@
-use std::fmt;
-use std::sync::Arc;
+use std::{
+    fmt,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    sync::Arc,
+    thread,
+};
 
 use minijinja::value::{Enumerator, ObjectRepr};
-use minijinja::{value::Object, Environment, UndefinedBehavior, Value};
+use minijinja::{
+    path_loader, value::Object, Environment, Error, ErrorKind,
+    UndefinedBehavior, Value,
+};
 
 #[derive(Debug, Clone)]
 pub enum SubstituteValue {
@@ -51,6 +60,11 @@ impl TrackingContext {
 impl Object for TrackingContext {
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
         let key_str = key.as_str()?;
+
+        // Returning None lets MiniJinja resolve registered global functions.
+        if key_str == "shell" {
+            return None;
+        }
 
         let res = match self.provider.lookup_value(key_str) {
             None => Value::from_object(PendingValue {
@@ -164,11 +178,31 @@ pub fn substitute(
     input: &str,
     provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
 ) -> anyhow::Result<String> {
+    substitute_in(input, provider, Path::new("."))
+}
+
+pub fn substitute_in(
+    input: &str,
+    provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
+    working_dir: &Path,
+) -> anyhow::Result<String> {
     let ctx = TrackingContext::new(provider);
 
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.set_keep_trailing_newline(true);
+    env.set_loader(path_loader(working_dir));
+
+    let function_working_dir = working_dir.to_owned();
+    env.add_function("shell", move |command: String| {
+        run_shell(&command, None, &function_working_dir)
+    });
+
+    let filter_working_dir = working_dir.to_owned();
+    env.add_filter("shell", move |input: String, command: String| {
+        run_shell(&command, Some(input), &filter_working_dir)
+    });
+
     env.add_filter("select_multiple", |v: Value| {
         if let Some(obj) = v.downcast_object_ref::<SingleSelect>() {
             Value::from_object({
@@ -200,10 +234,81 @@ pub fn substitute(
     Ok(env.render_str(input, ctx_val)?)
 }
 
+fn run_shell(
+    command: &str,
+    input: Option<String>,
+    working_dir: &Path,
+) -> Result<String, Error> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| shell_error(command, error))?;
+
+    // Write concurrently so a command can produce output while consuming a
+    // payload larger than the operating system's pipe buffer.
+    let stdin_writer = input.map(|input| {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        thread::spawn(move || stdin.write_all(input.as_bytes()))
+    });
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| shell_error(command, error))?;
+
+    if let Some(writer) = stdin_writer {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if output.status.success() => {
+                return Err(shell_error(command, error));
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                return Err(shell_error(command, "stdin writer panicked"));
+            }
+        }
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let message = if detail.is_empty() {
+            format!("shell command `{command}` exited with {}", output.status)
+        } else {
+            format!(
+                "shell command `{command}` exited with {}: {detail}",
+                output.status
+            )
+        };
+        return Err(Error::new(ErrorKind::InvalidOperation, message));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|error| shell_error(command, error))
+}
+
+fn shell_error(command: &str, error: impl fmt::Display) -> Error {
+    Error::new(
+        ErrorKind::InvalidOperation,
+        format!("shell command `{command}` failed: {error}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
+
+    use mktemp::Temp;
 
     struct TestProvider {
         vars: HashMap<String, SubstituteValue>,
@@ -281,10 +386,14 @@ mod tests {
         }
     }
 
+    fn render(input: &str, provider: TestProvider) -> anyhow::Result<String> {
+        substitute(input, Arc::new(provider))
+    }
+
     #[test]
     fn returns_the_input_unchanged() {
         let provider = create_provider();
-        let res = substitute("foo\nbar\n", Arc::new(provider)).unwrap();
+        let res = render("foo\nbar\n", provider).unwrap();
 
         assert_eq!(res, "foo\nbar\n".to_string());
     }
@@ -292,7 +401,7 @@ mod tests {
     #[test]
     fn substitutes_single_variable() {
         let provider = create_provider();
-        let res = substitute("foo {{url}}\nbar\n", Arc::new(provider)).unwrap();
+        let res = render("foo {{url}}\nbar\n", provider).unwrap();
 
         assert_eq!(res, "foo example.com\nbar\n".to_string());
     }
@@ -300,7 +409,7 @@ mod tests {
     #[test]
     fn substitutes_integer() {
         let provider = create_provider();
-        let res = substitute("foo={{integer}}", Arc::new(provider)).unwrap();
+        let res = render("foo={{integer}}", provider).unwrap();
 
         assert_eq!(res, "foo=42".to_string());
     }
@@ -308,11 +417,9 @@ mod tests {
     #[test]
     fn substitutes_placeholder_with_default_value() {
         let provider = create_provider();
-        let res = substitute(
-            "foo: {{ url | fallback('fallback.com') }}\n",
-            Arc::new(provider),
-        )
-        .unwrap();
+        let res =
+            render("foo: {{ url | fallback('fallback.com') }}\n", provider)
+                .unwrap();
 
         assert_eq!(res, "foo: example.com\n".to_string());
     }
@@ -320,11 +427,9 @@ mod tests {
     #[test]
     fn substitutes_default_value() {
         let provider = create_provider();
-        let res = substitute(
-            "foo: {{ href | fallback('fallback.com') }}\n",
-            Arc::new(provider),
-        )
-        .unwrap();
+        let res =
+            render("foo: {{ href | fallback('fallback.com') }}\n", provider)
+                .unwrap();
 
         assert_eq!(res, "foo: [fallback: fallback.com]\n".to_string());
     }
@@ -332,7 +437,7 @@ mod tests {
     #[test]
     fn returns_value_missing_for_missing_variable() {
         let provider = create_provider();
-        let res = substitute("foo: {{ href }}\n", Arc::new(provider)).unwrap();
+        let res = render("foo: {{ href }}\n", provider).unwrap();
 
         assert_eq!(res, "foo: [missing: href]\n".to_string());
     }
@@ -340,8 +445,7 @@ mod tests {
     #[test]
     fn substitutes_single_variable_with_spaces() {
         let provider = create_provider();
-        let res =
-            substitute("foo {{ url  }}\nbar\n", Arc::new(provider)).unwrap();
+        let res = render("foo {{ url  }}\nbar\n", provider).unwrap();
 
         assert_eq!(res, "foo example.com\nbar\n".to_string());
     }
@@ -349,9 +453,7 @@ mod tests {
     #[test]
     fn substitutes_one_variable_per_line() {
         let provider = create_provider();
-        let res =
-            substitute("foo {{url}}\nbar {{token}}\n", Arc::new(provider))
-                .unwrap();
+        let res = render("foo {{url}}\nbar {{token}}\n", provider).unwrap();
 
         assert_eq!(res, "foo example.com\nbar abc123\n".to_string());
     }
@@ -359,9 +461,7 @@ mod tests {
     #[test]
     fn substitutes_variable_on_the_same_line() {
         let provider = create_provider();
-        let res =
-            substitute("foo {{url}}, bar {{token}}\n", Arc::new(provider))
-                .unwrap();
+        let res = render("foo {{url}}, bar {{token}}\n", provider).unwrap();
 
         assert_eq!(res, "foo example.com, bar abc123\n".to_string());
     }
@@ -369,8 +469,7 @@ mod tests {
     #[test]
     fn substitutes_variable_with_underscore_and_number_in_name() {
         let provider = create_provider();
-        let res =
-            substitute("foo: {{ api_url1 }}", Arc::new(provider)).unwrap();
+        let res = render("foo: {{ api_url1 }}", provider).unwrap();
 
         assert_eq!(res, "foo: foo.com".to_string());
     }
@@ -378,11 +477,9 @@ mod tests {
     #[test]
     fn substitutes_list_joined() {
         let provider = create_provider();
-        let res = substitute(
-            "foo: {{ list | select_multiple | join('') }}",
-            Arc::new(provider),
-        )
-        .unwrap();
+        let res =
+            render("foo: {{ list | select_multiple | join('') }}", provider)
+                .unwrap();
 
         assert_eq!(res, "foo: 123".to_string());
     }
@@ -390,9 +487,9 @@ mod tests {
     #[test]
     fn substitutes_comma_separated_list() {
         let provider = create_provider();
-        let res = substitute(
+        let res = render(
             "foo: [ {{ list | select_multiple | join(', ') }} ]",
-            Arc::new(provider),
+            provider,
         )
         .unwrap();
 
@@ -402,11 +499,8 @@ mod tests {
     #[test]
     fn substitutes_list_quoted_join() {
         let provider = create_provider();
-        let res = substitute(
-            r#"foo: {{ list | select_multiple }}"#,
-            Arc::new(provider),
-        )
-        .unwrap();
+        let res =
+            render(r#"foo: {{ list | select_multiple }}"#, provider).unwrap();
 
         assert_eq!(res, r#"foo: ["1", "2", "3"]"#.to_string());
     }
@@ -414,9 +508,9 @@ mod tests {
     #[test]
     fn substitutes_list_of_objects() {
         let provider = create_provider();
-        let res = substitute(
+        let res = render(
             r#"{% for l in label %}"{{ l.value }}"{% if not loop.last %}, {% endif %}{% endfor %}"#,
-            Arc::new(provider),
+            provider,
         )
         .unwrap();
 
@@ -426,9 +520,9 @@ mod tests {
     #[test]
     fn returns_value_missing_when_var_missing_but_other_has_default() {
         let provider = create_provider();
-        let res = substitute(
+        let res = render(
             "{{ with_default | fallback('x') }} {{ missing }}",
-            Arc::new(provider),
+            provider,
         )
         .unwrap();
 
@@ -438,11 +532,8 @@ mod tests {
     #[test]
     fn fallback_filter_is_noop_when_value_present() {
         let provider = create_provider();
-        let res = substitute(
-            "{{ url | fallback('fallback.com') }}",
-            Arc::new(provider),
-        )
-        .unwrap();
+        let res =
+            render("{{ url | fallback('fallback.com') }}", provider).unwrap();
 
         assert_eq!(res, "example.com".to_string());
     }
@@ -450,8 +541,56 @@ mod tests {
     #[test]
     fn fails_for_template_syntax_error() {
         let provider = create_provider();
-        let res = substitute("{% if %}", Arc::new(provider));
+        let res = render("{% if %}", provider);
 
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn runs_shell_as_a_function() {
+        let res = render(
+            r#"{{ shell("printf 'hello from shell'") }}"#,
+            create_provider(),
+        )
+        .unwrap();
+
+        assert_eq!(res, "hello from shell");
+    }
+
+    #[test]
+    fn runs_shell_as_a_filter_with_the_value_as_stdin() {
+        let res = render(
+            r#"{{ "hello from filter" | shell("tr '[:lower:]' '[:upper:]'") }}"#,
+            create_provider(),
+        )
+        .unwrap();
+
+        assert_eq!(res, "HELLO FROM FILTER");
+    }
+
+    #[test]
+    fn pipes_an_included_file_to_shell() {
+        let tmp = Temp::new_dir().unwrap();
+        fs::write(tmp.join("payload.json"), "{\n  \"name\": \"Hitman\"\n}\n")
+            .unwrap();
+        let input = r#"{% filter shell("tr '[:lower:]' '[:upper:]'") %}{% include "payload.json" %}{% endfilter %}"#;
+
+        let res =
+            substitute_in(input, Arc::new(create_provider()), &tmp).unwrap();
+
+        assert_eq!(res, "{\n  \"NAME\": \"HITMAN\"\n}\n");
+    }
+
+    #[test]
+    fn reports_shell_command_failures() {
+        let error = render(
+            r#"{{ shell("printf 'bad command' >&2; exit 7") }}"#,
+            create_provider(),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("exit status: 7"));
+        assert!(message.contains("bad command"));
     }
 }

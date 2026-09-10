@@ -1,0 +1,4 @@
+{
+    "message": "Hello from an included Hitman template",
+    "target": "{{ base_url }}"
+}

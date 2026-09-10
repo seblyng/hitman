@@ -73,6 +73,45 @@ authorization_header: "Authorization: Bearer {{auth_token}}"
 Be careful, since there is currently no protection against cyclic references,
 something like `foo: "{{foo}}"` will likely overflow and crash.
 
+## Includes and shell commands
+
+Request templates can include files relative to the request file. Included
+files are themselves MiniJinja templates and have access to the same variables:
+
+```http
+POST {{base_url}}/users HTTP/1.1
+Content-Type: application/json
+
+{% include "payload.json" %}
+```
+
+The `shell` function executes a command with `sh -c` from the request file's
+directory and substitutes its standard output:
+
+```http
+POST {{base_url}}/users HTTP/1.1
+Content-Type: application/json
+
+{{ shell("cat payload.json | jq -c .") }}
+```
+
+`shell` is also available as a filter. The filtered value is provided to the
+command on standard input:
+
+```http
+POST {{base_url}}/documents HTTP/1.1
+Content-Type: application/json
+
+{
+  "content": "{% filter shell('openssl base64 -A') %}{% include 'payload.json' %}{% endfilter %}"
+}
+```
+
+A non-zero exit status stops request rendering and reports the command's
+standard error. Standard output is not trimmed. Shell commands provide
+arbitrary code execution, so request templates should be treated like shell
+scripts and only run from trusted sources.
+
 ## Running
 
 First, select which target to use:

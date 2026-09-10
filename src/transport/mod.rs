@@ -1,4 +1,4 @@
-use std::{fs::read_to_string, sync::Arc, time::Duration};
+use std::{fs::read_to_string, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use reqwest::Client;
@@ -41,7 +41,9 @@ pub fn prepare_request(
     provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
 ) -> Result<PreparedRequest> {
     let input = read_to_string(resolved.http_file())?;
-    let rendered = substitute::substitute(&input, provider.clone())?;
+    let working_dir = resolved.http_file().parent().unwrap_or(Path::new("."));
+    let rendered =
+        substitute::substitute_in(&input, provider.clone(), working_dir)?;
 
     match &resolved.resolved_as {
         ResolvedAs::Simple { .. } if grpc::is_grpc_request(&rendered) => Ok(
