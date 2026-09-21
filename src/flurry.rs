@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::spawn;
 
 use crate::{
+    oauth,
     prompt::get_interaction,
     resolve::Resolved,
     scope::Scope,
@@ -19,6 +20,7 @@ use crate::{
 
 pub async fn flurry_attack(
     resolved: &Resolved,
+    target: &str,
     flurry_size: i32,
     connections: i32,
     scope: &Scope,
@@ -31,10 +33,11 @@ pub async fn flurry_attack(
     }
 
     let client = build_client(&resolved.root_dir)?;
+    let scope = oauth::resolve_scope(resolved, target, scope).await?;
 
     warn!("# Sending {flurry_size} requests on {connections} parallel connections...");
 
-    let interaction = get_interaction(scope.clone());
+    let interaction = get_interaction(scope);
     let req = match transport::prepare_request(resolved, interaction)? {
         PreparedRequest::Http(req) => req,
         PreparedRequest::GraphQL(req) => req.http,

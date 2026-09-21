@@ -179,7 +179,7 @@ pub fn update_data(root_dir: &Path, vars: &TomlTable) -> Result<()> {
     Ok(())
 }
 
-fn read_and_merge_config(root_dir: &Path) -> Result<TomlTable> {
+pub(crate) fn read_and_merge_config(root_dir: &Path) -> Result<TomlTable> {
     let mut config = TomlTable::new();
 
     if let Some(content) = read_toml(&root_dir.join(CONFIG_FILE))? {
@@ -191,6 +191,10 @@ fn read_and_merge_config(root_dir: &Path) -> Result<TomlTable> {
     }
 
     Ok(config)
+}
+
+pub(crate) fn read_data(root_dir: &Path) -> Result<TomlTable> {
+    Ok(read_toml(&root_dir.join(DATA_FILE))?.unwrap_or_default())
 }
 
 /// Merge Toml tables recursively, merging child tables into

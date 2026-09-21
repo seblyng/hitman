@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
             let scope = load_env(&target, &resolved, &args.options)?;
             flurry_attack(
                 &resolved,
+                &target,
                 flurry_size,
                 args.connections.unwrap_or(10),
                 &scope,
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
             .await
         } else if let Some(delay_seconds) = args.monitor {
             let scope = load_env(&target, &resolved, &args.options)?;
-            monitor(&resolved, delay_seconds, &scope).await
+            monitor(&resolved, &target, delay_seconds, &scope).await
         } else {
             let res = run_once(&target, &resolved, &args.options).await;
 
@@ -139,7 +140,7 @@ async fn run_once(
 ) -> Result<()> {
     let scope = load_env(target, resolved, options)?;
 
-    make_request(resolved, &scope).await
+    make_request(resolved, target, &scope).await
 }
 
 async fn watch_mode(

@@ -73,6 +73,71 @@ authorization_header: "Authorization: Bearer {{auth_token}}"
 Be careful, since there is currently no protection against cyclic references,
 something like `foo: "{{foo}}"` will likely overflow and crash.
 
+## OAuth 2.0
+
+OAuth profiles are configured under `_oauth`. The profile name is also the
+template variable that receives the access token. Hitman only performs an OAuth
+flow when that variable is referenced by the request.
+
+Authorization code with PKCE:
+
+```toml
+[_oauth.github_access_token]
+flow = "authorization_code"
+authorization_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+client_id = "your-client-id"
+redirect_uri = "http://127.0.0.1:8765/callback"
+scopes = ["repo"]
+```
+
+The redirect URI must be registered with the provider. Hitman opens the login
+URL in the browser and listens on the configured loopback address for up to five
+minutes.
+
+Client credentials:
+
+```toml
+[_oauth.orders_access_token]
+flow = "client_credentials"
+token_url = "https://identity.example.com/oauth/token"
+client_id = "orders-cli"
+client_secret = "your-client-secret"
+scopes = ["orders.read"]
+```
+
+Secrets should normally be placed in the git-ignored `hitman.local.toml` file.
+Providers that require credentials in the request body can set
+`client_auth_method = "request_body"`. Provider-specific parameters can be
+added with `authorization_params` and `token_params`:
+
+```toml
+[_oauth.github_access_token.authorization_params]
+audience = "https://api.example.com"
+```
+
+Use the managed variable like any other Hitman value:
+
+```http
+GET https://api.github.com/user
+Authorization: Bearer {{github_access_token}}
+```
+
+Hitman caches access and refresh tokens in `.hitman-data.toml`, scoped by the
+selected target and profile name. Expired tokens are refreshed automatically.
+The data file is not encrypted.
+
+An ordinary config, request-specific, persisted, or command-line value with the
+same name takes precedence and suppresses OAuth acquisition. This is useful in
+CI:
+
+```sh
+hitman request.http github_access_token="$TOKEN"
+```
+
+Authorization-code login cannot start in non-interactive mode, but cached token
+refresh and client-credentials acquisition still work.
+
 ## Includes and shell commands
 
 Request templates can include files relative to the request file. Included

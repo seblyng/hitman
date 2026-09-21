@@ -5,6 +5,7 @@ use tokio::time::sleep;
 use std::time::Duration;
 
 use crate::{
+    oauth,
     prompt::get_interaction,
     resolve::Resolved,
     scope::Scope,
@@ -17,6 +18,7 @@ use crate::{
 
 pub async fn monitor(
     resolved: &Resolved,
+    target: &str,
     delay_seconds: i32,
     scope: &Scope,
 ) -> Result<()> {
@@ -28,16 +30,16 @@ pub async fn monitor(
 
     warn!("# Repeating every {delay} seconds, until interrupted...");
 
-    let interaction = get_interaction(scope.clone());
-    let req = match transport::prepare_request(resolved, interaction)? {
-        PreparedRequest::Http(req) => req,
-        PreparedRequest::GraphQL(req) => req.http,
-        PreparedRequest::Grpc(_) => {
-            bail!("Monitor mode does not support gRPC requests yet")
-        }
-    };
-
     loop {
+        let scope = oauth::resolve_scope(resolved, target, scope).await?;
+        let interaction = get_interaction(scope);
+        let req = match transport::prepare_request(resolved, interaction)? {
+            PreparedRequest::Http(req) => req,
+            PreparedRequest::GraphQL(req) => req.http,
+            PreparedRequest::Grpc(_) => {
+                bail!("Monitor mode does not support gRPC requests yet")
+            }
+        };
         let res = do_request(&client, &req).await;
 
         match res {

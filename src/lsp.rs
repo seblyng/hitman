@@ -1316,6 +1316,18 @@ fn find_toml_key_definitions(
 
     push_toml_value_definition(text, root, key, &mut definitions);
 
+    if let Some(oauth) = root.get("_oauth").and_then(TomlEditItem::as_table) {
+        if let Some((profile_key, TomlEditItem::Table(_))) =
+            oauth.get_key_value(key)
+        {
+            if let Some(range) =
+                profile_key.span().map(|span| byte_range(text, span))
+            {
+                definitions.push(TomlKeyDefinition { range, value: None });
+            }
+        }
+    }
+
     if let Some(table) = target
         .and_then(|target| root.get(target))
         .and_then(TomlEditItem::as_table)
@@ -2515,6 +2527,32 @@ mod tests {
                 == Url::from_file_path(tmp.join("hitman.local.toml")).unwrap()
                 && definition.range.start == Position::new(1, 0)
         }));
+    }
+
+    #[test]
+    fn definition_finds_oauth_managed_variable() {
+        let tmp = Temp::new_dir().unwrap();
+        fs::write(
+            tmp.join("hitman.toml"),
+            "[_oauth.github_access_token]\nflow = \"client_credentials\"\ntoken_url = \"https://example.com/token\"\nclient_id = \"client\"\n",
+        )
+        .unwrap();
+        let request = tmp.join("request.http");
+        let text = "GET https://example.com\nAuthorization: Bearer {{github_access_token}}\n";
+        fs::write(&request, text).unwrap();
+        let uri = Url::from_file_path(request).unwrap();
+
+        let definitions =
+            definition_for_position(&uri, text, Position::new(1, 30))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0].uri,
+            Url::from_file_path(tmp.join("hitman.toml")).unwrap()
+        );
+        assert_eq!(definitions[0].range.start, Position::new(0, 8));
     }
 
     #[test]

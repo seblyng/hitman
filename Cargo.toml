@@ -30,6 +30,8 @@ anyhow = "1.0.78"
 fuzzy-matcher = "0.3.7"
 graphql-parser = "0.4.0"
 minijinja = { version = "2", features = ["json"] }
+oauth2 = { version = "5", features = ["reqwest"] }
+open = "5"
 tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-native-roots"] }
 prost-reflect = { version = "0.16", features = ["serde"] }
 protox = "0.9"

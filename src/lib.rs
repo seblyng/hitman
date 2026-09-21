@@ -3,6 +3,7 @@ pub mod extract;
 pub mod flurry;
 pub mod lsp;
 pub mod monitor;
+pub mod oauth;
 pub mod request;
 pub mod resolve;
 pub mod scope;
