@@ -5,14 +5,20 @@ use spinoff::{Color, Spinner, Streams, spinners};
 use crate::{
     env::update_data,
     extract::extract_variables,
+    oauth,
     prompt::get_interaction,
     resolve::Resolved,
     scope::Scope,
     transport::{self, http::build_client},
 };
 
-pub async fn make_request(resolved: &Resolved, scope: &Scope) -> Result<()> {
+pub async fn make_request(
+    resolved: &Resolved,
+    target: &str,
+    scope: &Scope,
+) -> Result<()> {
     let client = build_client(&resolved.root_dir)?;
+    let scope = oauth::resolve_scope(resolved, target, scope).await?;
 
     let interaction = get_interaction(scope.clone());
 
@@ -41,7 +47,7 @@ pub async fn make_request(resolved: &Resolved, scope: &Scope) -> Result<()> {
     let result = transport::finish_response(response).await?;
 
     if let Some(json) = result.json {
-        let vars = extract_variables(&json, scope)?;
+        let vars = extract_variables(&json, &scope)?;
         update_data(&resolved.root_dir, &vars)?;
     }
 

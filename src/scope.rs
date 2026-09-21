@@ -25,6 +25,10 @@ impl From<Table> for Scope {
 }
 
 impl Scope {
+    pub fn insert(&mut self, key: String, value: String) {
+        self.0.insert(key, Value::String(value));
+    }
+
     pub fn lookup(&self, key: &str) -> anyhow::Result<Replacement> {
         let rep = match self.0.get(key) {
             None => Replacement::ValueNotFound { key: key.into() },
