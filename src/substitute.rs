@@ -219,7 +219,18 @@ pub fn substitute_in(
             v
         }
     });
-    env.add_filter("select_one", |v: Value| v);
+    let select_one_provider = ctx.provider.clone();
+    env.add_filter("select_one", move |v: Value| {
+        if let Some(obj) = v.downcast_object_ref::<SingleSelect>() {
+            select_one_provider
+                .select_single(&obj.key, &obj.values)
+                .map_err(|error| {
+                    Error::new(ErrorKind::InvalidOperation, error.to_string())
+                })
+        } else {
+            Ok(v)
+        }
+    });
 
     env.add_filter("fallback", move |v: Value, fallback: String| {
         if let Some(obj) = v.downcast_object_ref::<PendingValue>() {
@@ -579,6 +590,30 @@ mod tests {
             substitute_in(input, Arc::new(create_provider()), &tmp).unwrap();
 
         assert_eq!(res, "{\n  \"NAME\": \"HITMAN\"\n}\n");
+    }
+
+    #[test]
+    fn includes_file_selected_by_variable() {
+        let tmp = Temp::new_dir().unwrap();
+        fs::write(tmp.join("alpha.json"), "alpha payload").unwrap();
+
+        let mut vars = create_vars();
+        vars.insert(
+            "choice_file".to_string(),
+            SubstituteValue::Multiple(vec![
+                toml::Value::from("alpha.json"),
+                toml::Value::from("beta.json"),
+            ]),
+        );
+
+        let res = substitute_in(
+            "{% include choice_file | select_one %}",
+            Arc::new(TestProvider { vars }),
+            &tmp,
+        )
+        .unwrap();
+
+        assert_eq!(res, "alpha payload");
     }
 
     #[test]
