@@ -75,17 +75,18 @@ fn parse_local_variables(
 
     for line in input.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.starts_with('@') {
+        let declaration = trimmed.split_once('#').map_or(trimmed, |(before, _)| before).trim_end();
+        if declaration.starts_with('@') {
             declarations_started = true;
-            let (key, value) = trimmed[1..]
+            let (key, value) = declaration[1..]
                 .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("Invalid variable declaration `{trimmed}`; expected `@name = value`"))?;
+                .ok_or_else(|| anyhow::anyhow!("Invalid variable declaration `{declaration}`; expected `@name = value`"))?;
             let key = key.trim();
             if key.is_empty()
                 || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 anyhow::bail!(
-                    "Invalid variable name `{key}` in declaration `{trimmed}`"
+                    "Invalid variable name `{key}` in declaration `{declaration}`"
                 );
             }
             values.insert(
@@ -116,6 +117,17 @@ mod tests {
         assert_eq!(body, "GET {{base_url}}/users/{{user_id}} HTTP/1.1\n");
         assert_eq!(values["base_url"].as_str(), Some("https://example.com"));
         assert_eq!(values["user_id"].as_str(), Some("42"));
+    }
+
+    #[test]
+    fn ignores_trailing_comments_on_local_variable_declarations() {
+        let (body, values) = parse_local_variables(
+            "@base_url = https://example.com # service URL\n\nGET {{base_url}} HTTP/1.1\n",
+        )
+        .unwrap();
+
+        assert_eq!(values["base_url"].as_str(), Some("https://example.com"));
+        assert_eq!(body, "GET {{base_url}} HTTP/1.1\n");
     }
 
     #[test]

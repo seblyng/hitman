@@ -163,3 +163,22 @@ impl Display for GraphQLRequest {
         self.http.fmt(f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_graphql_comments_on_their_own_line_and_inline() {
+        let query = "# query note\nquery Example($id: ID!) { # selection note\n  user(id: $id) { id } # field note\n}\n";
+        let parsed = graphql_parser::parse_query::<String>(query);
+        assert!(parsed.is_ok());
+
+        let doc = parsed.unwrap();
+        let graphql_parser::query::Definition::Operation(
+            graphql_parser::query::OperationDefinition::Query(operation),
+        ) = &doc.definitions[0]
+        else {
+            panic!("expected query operation");
+        };
+        assert_eq!(operation.variable_definitions[0].name, "id");
+    }
+}

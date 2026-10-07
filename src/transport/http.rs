@@ -78,6 +78,7 @@ pub fn build_client(root_dir: &Path) -> Result<Client> {
 }
 
 pub fn prepare_request(input: &str) -> Result<HttpRequest> {
+    let input = strip_header_comments(input);
     let mut headers_buf = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers_buf);
 
@@ -108,6 +109,37 @@ pub fn prepare_request(input: &str) -> Result<HttpRequest> {
     })
 }
 
+/// HTTP request files use `#` comments in the request/header section. Once the
+/// empty line introducing the body is reached, leave the payload untouched
+/// (in particular, JSON strings and values must not be comment-stripped).
+fn strip_header_comments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_body = false;
+    let mut request_started = false;
+
+    for line in input.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if !in_body && content.trim().is_empty() && request_started {
+            in_body = true;
+        } else if !in_body && content.trim_start().starts_with('#') {
+            continue;
+        } else if !in_body && !content.trim().is_empty() {
+            request_started = true;
+        }
+        if !in_body {
+            let comment_start = content.find('#');
+            if let Some(index) = comment_start {
+                output.push_str(content[..index].trim_end());
+                output.push_str(&line[content.len()..]);
+                continue;
+            }
+        }
+        output.push_str(line);
+    }
+
+    output
+}
+
 pub fn parse_headers(req: &httparse::Request<'_, '_>) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
 
@@ -122,6 +154,22 @@ pub fn parse_headers(req: &httparse::Request<'_, '_>) -> Result<HeaderMap> {
     }
 
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_request;
+
+    #[test]
+    fn ignores_comments_in_request_section_but_preserves_json_body() {
+        let request = prepare_request(
+            "# request note\nGET https://example.com HTTP/1.1 # request trailing note\n# header note\nContent-Type: application/json # header trailing note\n\n{\n  \"text\": \"# not a comment\"\n}\n",
+        )
+        .unwrap();
+
+        assert_eq!(request.body.unwrap().into_string(), "{\n  \"text\": \"# not a comment\"\n}\n");
+        assert_eq!(request.headers["content-type"], "application/json");
+    }
 }
 
 pub async fn send(
