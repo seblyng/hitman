@@ -1,4 +1,7 @@
-use std::{fs::read_to_string, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, fs::read_to_string, path::Path, sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use reqwest::Client;
@@ -42,8 +45,13 @@ pub fn prepare_request(
 ) -> Result<PreparedRequest> {
     let input = read_to_string(resolved.http_file())?;
     let working_dir = resolved.http_file().parent().unwrap_or(Path::new("."));
-    let rendered =
-        substitute::substitute_in(&input, provider.clone(), working_dir)?;
+    let (template, local_values) = parse_local_variables(&input)?;
+    let rendered = substitute::substitute_with_locals(
+        &template,
+        provider.clone(),
+        working_dir,
+        local_values,
+    )?;
 
     match &resolved.resolved_as {
         ResolvedAs::Simple { .. } if grpc::is_grpc_request(&rendered) => Ok(
@@ -55,6 +63,76 @@ pub fn prepare_request(
         ResolvedAs::GraphQL { .. } => Ok(PreparedRequest::GraphQL(
             graphql::prepare_request(resolved, &rendered, provider)?,
         )),
+    }
+}
+
+fn parse_local_variables(
+    input: &str,
+) -> Result<(String, HashMap<String, minijinja::Value>)> {
+    let mut values = HashMap::new();
+    let mut body_start = 0;
+    let mut declarations_started = false;
+
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with('@') {
+            declarations_started = true;
+            let (key, value) = trimmed[1..]
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("Invalid variable declaration `{trimmed}`; expected `@name = value`"))?;
+            let key = key.trim();
+            if key.is_empty()
+                || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                anyhow::bail!(
+                    "Invalid variable name `{key}` in declaration `{trimmed}`"
+                );
+            }
+            values.insert(
+                key.to_string(),
+                minijinja::Value::from(value.trim().to_string()),
+            );
+            body_start += line.len();
+        } else if declarations_started && trimmed.trim().is_empty() {
+            body_start += line.len();
+        } else {
+            break;
+        }
+    }
+
+    Ok((input[body_start..].to_string(), values))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_local_variables;
+
+    #[test]
+    fn parses_leading_local_variables_and_removes_them_from_request() {
+        let (body, values) = parse_local_variables(
+            "@base_url = https://example.com\n@user_id = 42\n\nGET {{base_url}}/users/{{user_id}} HTTP/1.1\n",
+        ).unwrap();
+
+        assert_eq!(body, "GET {{base_url}}/users/{{user_id}} HTTP/1.1\n");
+        assert_eq!(values["base_url"].as_str(), Some("https://example.com"));
+        assert_eq!(values["user_id"].as_str(), Some("42"));
+    }
+
+    #[test]
+    fn leaves_request_unchanged_without_leading_declarations() {
+        let input =
+            "GET https://example.com HTTP/1.1\n@not_a_declaration = value\n";
+        let (body, values) = parse_local_variables(input).unwrap();
+
+        assert_eq!(body, input);
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_leading_declaration() {
+        assert!(
+            parse_local_variables("@missing_equals\nGET / HTTP/1.1\n").is_err()
+        );
     }
 }
 

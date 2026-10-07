@@ -35,6 +35,17 @@ project
 The HTTP files are templates for literal HTTP requests. Variables in double
 curly braces will be substituted with values from the config file.
 
+Request files can also define variables at the top of the file with `@name = value`.
+These values apply only to that request and override values with the same name
+from the configuration or extracted data:
+
+```http
+@base_url = https://api.example.com
+@user_id = 123
+
+GET {{base_url}}/users/{{user_id}} HTTP/1.1
+```
+
 ```
 POST {{base_url}}/login HTTP/1.1
 Content-Type: application/json

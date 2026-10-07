@@ -47,13 +47,18 @@ impl fmt::Debug for dyn SubstituteProvider + Send + Sync {
 #[derive(Debug)]
 struct TrackingContext {
     provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
+    local_values: std::collections::HashMap<String, Value>,
 }
 
 impl TrackingContext {
     fn new(
         provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
+        local_values: std::collections::HashMap<String, Value>,
     ) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            local_values,
+        }
     }
 }
 
@@ -64,6 +69,10 @@ impl Object for TrackingContext {
         // Returning None lets MiniJinja resolve registered global functions.
         if key_str == "shell" {
             return None;
+        }
+
+        if let Some(value) = self.local_values.get(key_str) {
+            return Some(value.clone());
         }
 
         let res = match self.provider.lookup_value(key_str) {
@@ -186,7 +195,16 @@ pub fn substitute_in(
     provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
     working_dir: &Path,
 ) -> anyhow::Result<String> {
-    let ctx = TrackingContext::new(provider);
+    substitute_with_locals(input, provider, working_dir, Default::default())
+}
+
+pub fn substitute_with_locals(
+    input: &str,
+    provider: Arc<dyn SubstituteProvider + Send + Sync + 'static>,
+    working_dir: &Path,
+    local_values: std::collections::HashMap<String, Value>,
+) -> anyhow::Result<String> {
+    let ctx = TrackingContext::new(provider, local_values);
 
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
