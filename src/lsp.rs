@@ -1236,7 +1236,59 @@ fn variable_definitions(
         );
     }
 
+    // Local variables are declared at the beginning of the .http file itself
+    // (for example `@base_url = https://example.com`).
+    let request_text = fs::read_to_string(&request_path).unwrap_or_default();
+    let request_uri = Url::from_file_path(&request_path)
+        .map_err(|_| anyhow::anyhow!("Invalid file path"))?;
+    definitions.extend(
+        find_local_variable_definitions(&request_text, key)
+            .into_iter()
+            .map(|definition| VariableDefinition {
+                location: Location {
+                    uri: request_uri.clone(),
+                    range: definition.range,
+                },
+                value: definition.value,
+            }),
+    );
+
     Ok(definitions)
+}
+
+fn find_local_variable_definitions(text: &str, key: &str) -> Vec<TomlKeyDefinition> {
+    let mut definitions = Vec::new();
+    let mut declarations_started = false;
+    let mut offset = 0;
+
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let declaration = content
+            .split_once('#')
+            .map_or(content, |(before, _)| before)
+            .trim_end();
+        if let Some(after_at) = declaration.strip_prefix('@') {
+            declarations_started = true;
+            if let Some((name, value)) = after_at.split_once('=') {
+                let name_start = 1 + after_at.len() - after_at.trim_start().len();
+                if name.trim() == key {
+                    let start = offset + name_start;
+                    let end = start + name.trim().len();
+                    definitions.push(TomlKeyDefinition {
+                        range: byte_range(text, start..end),
+                        value: Some(toml::Value::String(value.trim().to_string())),
+                    });
+                }
+            }
+        } else if declarations_started && content.trim().is_empty() {
+            // Blank separator lines are permitted before the request.
+        } else {
+            break;
+        }
+        offset += line.len();
+    }
+
+    definitions
 }
 
 fn variable_at_position(
@@ -2622,6 +2674,31 @@ mod tests {
             panic!("expected string hover");
         };
         assert_eq!(contents, "`dev-only`");
+    }
+
+    #[test]
+    fn local_variable_definition_and_hover_use_http_declaration() {
+        let tmp = Temp::new_dir().unwrap();
+        let request = tmp.join("request.http");
+        let text = "@base_url = https://example.com # API endpoint\n\nGET {{base_url}}/users HTTP/1.1\n";
+        fs::write(&request, text).unwrap();
+        let uri = Url::from_file_path(&request).unwrap();
+
+        let definitions = definition_for_position(&uri, text, Position::new(2, 8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].uri, uri);
+        assert_eq!(definitions[0].range.start, Position::new(0, 1));
+        assert_eq!(definitions[0].range.end, Position::new(0, 9));
+
+        let hover = hover_for_position(&uri, text, Position::new(2, 8))
+            .unwrap()
+            .unwrap();
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected string hover");
+        };
+        assert_eq!(contents, "`https://example.com`");
     }
 
     #[test]
