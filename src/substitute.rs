@@ -118,6 +118,22 @@ impl Object for PendingValue {
         ObjectRepr::Plain
     }
 
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let field = key.as_str()?;
+        if !matches!(field, "year" | "month" | "day")
+            || !(self.key.ends_with("_date") || self.key.ends_with("Date"))
+        {
+            return None;
+        }
+        let value = self
+            .provider
+            .prompt(&self.key, self.fallback.as_deref())
+            .ok()?;
+        value
+            .downcast_object_ref::<crate::prompt::SelectedDate>()?
+            .field(field)
+    }
+
     fn render(
         self: &Arc<Self>,
         f: &mut std::fmt::Formatter<'_>,
@@ -353,6 +369,13 @@ mod tests {
             key: &str,
             fallback: Option<&str>,
         ) -> anyhow::Result<Value> {
+            if key == "endDate" {
+                return Ok(Value::from_object(
+                    crate::prompt::SelectedDate::new(
+                        chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+                    ),
+                ));
+            }
             if let Some(fb) = fallback {
                 Ok(Value::from(format!("[fallback: {fb}]")))
             } else {
@@ -433,6 +456,21 @@ mod tests {
         let res = render("foo {{url}}\nbar\n", provider).unwrap();
 
         assert_eq!(res, "foo example.com\nbar\n".to_string());
+    }
+
+    #[test]
+    fn date_variable_exposes_fields_and_renders_as_iso_date() {
+        let provider = create_provider();
+        let res = render(
+            r#"{"endDate":{"year":{{ endDate.year }},"month":{{ endDate.month }},"day":{{ endDate.day }},"iso":"{{ endDate }}"}}"#,
+            provider,
+        )
+        .unwrap();
+
+        assert_eq!(
+            res,
+            r#"{"endDate":{"year":2026,"month":10,"day":5,"iso":"2026-10-05"}}"#
+        );
     }
 
     #[test]

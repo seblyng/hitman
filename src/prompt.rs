@@ -1,7 +1,11 @@
 use anyhow::{bail, Result};
+use chrono::Datelike;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use inquire::{list_option::ListOption, DateSelect, MultiSelect, Select, Text};
-use minijinja::Value as JinjaValue;
+use minijinja::{
+    value::{Object, ObjectRepr},
+    Value as JinjaValue,
+};
 use std::{
     collections::HashMap,
     env,
@@ -148,8 +152,7 @@ impl SubstituteProvider for CliUserInteraction {
     }
 
     fn prompt(&self, key: &str, fallback: Option<&str>) -> Result<JinjaValue> {
-        let val = prompt_user(key, fallback)?;
-        let value = JinjaValue::from(val);
+        let value = prompt_user_value(key, fallback)?;
 
         let mut vars_mut = self.vars.write().unwrap();
         vars_mut
@@ -174,23 +177,61 @@ impl SubstituteProvider for CliUserInteraction {
     }
 }
 
-fn prompt_user(key: &str, fallback: Option<&str>) -> Result<String> {
-    let fb = fallback.unwrap_or("");
-
+fn prompt_user_value(key: &str, fallback: Option<&str>) -> Result<JinjaValue> {
     if key.ends_with("_date") || key.ends_with("Date") {
-        if let Some(date) = prompt_for_date(key)? {
-            return Ok(date);
+        if let Some(date) = prompt_for_selected_date(key)? {
+            return Ok(JinjaValue::from_object(SelectedDate(date)));
         }
+        return Ok(JinjaValue::from(
+            Text::new(&format!("Enter value for {key}"))
+                .with_default(fallback.unwrap_or(""))
+                .prompt()?,
+        ));
     }
-
     let input = Text::new(&format!("Enter value for {key}"))
-        .with_default(fb)
+        .with_default(fallback.unwrap_or(""))
         .prompt()?;
-
-    Ok(input)
+    Ok(JinjaValue::from(input))
 }
 
-fn prompt_for_date(key: &str) -> Result<Option<String>> {
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedDate(chrono::NaiveDate);
+
+impl SelectedDate {
+    #[cfg(test)]
+    pub(crate) fn new(date: chrono::NaiveDate) -> Self {
+        Self(date)
+    }
+
+    pub(crate) fn field(&self, key: &str) -> Option<JinjaValue> {
+        let value = match key {
+            "year" => self.0.year() as i64,
+            "month" => self.0.month() as i64,
+            "day" => self.0.day() as i64,
+            _ => return None,
+        };
+        Some(JinjaValue::from(value))
+    }
+}
+
+impl Object for SelectedDate {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Plain
+    }
+
+    fn get_value(self: &Arc<Self>, key: &JinjaValue) -> Option<JinjaValue> {
+        self.field(key.as_str()?)
+    }
+
+    fn render(
+        self: &Arc<Self>,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "{}", self.0.format("%Y-%m-%d"))
+    }
+}
+
+fn prompt_for_selected_date(key: &str) -> Result<Option<chrono::NaiveDate>> {
     let msg = format!("Select a date for {key}");
     let formatter =
         |date: chrono::NaiveDate| date.format("%Y-%m-%d").to_string();
@@ -200,7 +241,7 @@ fn prompt_for_date(key: &str) -> Result<Option<String>> {
         .with_formatter(&formatter)
         .prompt_skippable()?;
 
-    Ok(res.map(formatter))
+    Ok(res)
 }
 
 fn select_replacement(key: &str, values: &[Value]) -> Result<JinjaValue> {

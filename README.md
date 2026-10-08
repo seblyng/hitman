@@ -312,6 +312,20 @@ When run in a non-interactive mode (`-n`, `--flurry` etc), the fallback value
 will be used without prompting the user, unless a value is specified in the
 config, or given on the command line.
 
+Variables ending in `_date` or `Date` open a date picker in interactive mode.
+The selected date can be used as a `YYYY-MM-DD` string, or accessed as numeric
+`year`, `month`, and `day` fields. For example:
+
+```json
+{
+  "endDate": {
+    "year": {{ endDate.year }},
+    "month": {{ endDate.month }},
+    "day": {{ endDate.day }}
+  }
+}
+```
+
 ## List value selection
 
 It's possible to specify multiple values for a variable in the config file, as
