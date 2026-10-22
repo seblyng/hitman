@@ -18,8 +18,9 @@ use tower_lsp::{
         CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand,
         CodeActionParams, CodeActionProviderCapability, Command,
         CompletionItem, CompletionItemKind, CompletionOptions,
-        CompletionParams, CompletionResponse, CompletionTextEdit,
-        DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+        CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic,
+        DiagnosticSeverity, DidChangeTextDocumentParams,
+        DidCloseTextDocumentParams, DidOpenTextDocumentParams,
         ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams,
         GotoDefinitionResponse, Hover, HoverContents, HoverParams,
         HoverProviderCapability, InitializeParams, InitializeResult,
@@ -69,6 +70,24 @@ struct Backend {
     documents: Arc<Mutex<HashMap<Url, String>>>,
 }
 
+impl Backend {
+    async fn update_document(&self, uri: Url, text: String, version: i32) {
+        // Serialize updates and publication so older edits cannot overwrite
+        // diagnostics for newer document versions.
+        let mut documents = self.documents.lock().await;
+        documents.insert(uri.clone(), text.clone());
+        let diagnostic_uri = uri.clone();
+        let diagnostics = tokio::task::spawn_blocking(move || {
+            diagnostics_for_document(&diagnostic_uri, &text)
+        })
+        .await
+        .unwrap_or_default();
+        self.client
+            .publish_diagnostics(uri, diagnostics, Some(version))
+            .await;
+    }
+}
+
 #[async_trait]
 impl LanguageServer for Backend {
     async fn initialize(
@@ -96,7 +115,10 @@ impl LanguageServer for Backend {
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["\"".to_string()]),
+                    trigger_characters: Some(vec![
+                        "\"".to_string(),
+                        "/".to_string(),
+                    ]),
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
@@ -114,19 +136,27 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.documents
-            .lock()
-            .await
-            .insert(params.text_document.uri, params.text_document.text);
+        let document = params.text_document;
+        self.update_document(document.uri, document.text, document.version)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.documents
-                .lock()
-                .await
-                .insert(params.text_document.uri, change.text);
+            self.update_document(
+                params.text_document.uri,
+                change.text,
+                params.text_document.version,
+            )
+            .await;
         }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let mut documents = self.documents.lock().await;
+        let uri = params.text_document.uri;
+        documents.remove(&uri);
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn code_action(
@@ -630,6 +660,9 @@ fn completion_for_position(
     text: &str,
     position: Position,
 ) -> Result<Option<CompletionResponse>> {
+    if let Some(completion) = grpc_method_completion(uri, text, position)? {
+        return Ok(Some(completion));
+    }
     let Some(body_start) = body_start_offset(text) else {
         return Ok(None);
     };
@@ -679,6 +712,66 @@ fn completion_for_position(
     } else {
         Ok(Some(CompletionResponse::Array(items)))
     }
+}
+
+fn grpc_method_completion(
+    uri: &Url,
+    text: &str,
+    position: Position,
+) -> Result<Option<CompletionResponse>> {
+    let Some(line) = text.lines().nth(position.line as usize) else {
+        return Ok(None);
+    };
+    let Some(target) = line.trim_start().strip_prefix("GRPC ") else {
+        return Ok(None);
+    };
+    let target = target.trim_end();
+    let Some(slash) = target.rfind('/') else {
+        return Ok(None);
+    };
+    let method = &target[slash + 1..];
+    // A slash inside a template expression isn't a method separator.
+    if method.contains(['{', '}', ' ']) {
+        return Ok(None);
+    }
+    let method_start =
+        line.len() - line.trim_start().len() + "GRPC ".len() + slash + 1;
+    let start = line[..method_start].encode_utf16().count() as u32;
+    let end = start + method.encode_utf16().count() as u32;
+    if position.character < start || position.character > end {
+        return Ok(None);
+    }
+
+    let path = uri_to_path(uri)?;
+    let base = diagnostic_template_value(&path, text, &target[..slash])?;
+    let service_name = base.rsplit('/').next().unwrap_or_default();
+    let source = descriptor_source(&path, text)?;
+    let pool = load_descriptor_pool(&source)?;
+    let Some(service) = pool.get_service_by_name(service_name) else {
+        return Ok(None);
+    };
+    let range = Range::new(
+        Position::new(position.line, start),
+        Position::new(position.line, end),
+    );
+    let items = service
+        .methods()
+        .map(|method| CompletionItem {
+            label: method.name().to_string(),
+            kind: Some(CompletionItemKind::METHOD),
+            detail: Some(format!(
+                "{} → {}",
+                method.input().full_name(),
+                method.output().full_name()
+            )),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: method.name().to_string(),
+            })),
+            ..Default::default()
+        })
+        .collect();
+    Ok(Some(CompletionResponse::Array(items)))
 }
 
 fn field_completion_items(
@@ -1591,6 +1684,193 @@ fn replace_grpc_method(
     Ok(format!("{prefix}{target}{trailing}"))
 }
 
+fn diagnostic_for_line(
+    line_index: usize,
+    line: &str,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range::new(
+            Position::new(line_index as u32, 0),
+            Position::new(
+                line_index as u32,
+                line.encode_utf16().count() as u32,
+            ),
+        ),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("hitman".to_string()),
+        message,
+        ..Default::default()
+    }
+}
+
+fn diagnostics_for_document(uri: &Url, text: &str) -> Vec<Diagnostic> {
+    let Some((request_index, request_line)) =
+        text.lines().enumerate().find(|(_, line)| {
+            let line = line.trim_start();
+            line == "GRPC" || line.starts_with("GRPC ")
+        })
+    else {
+        return Vec::new();
+    };
+    let mut diagnostics = Vec::new();
+    let path = match uri_to_path(uri) {
+        Ok(path) => path,
+        Err(_) => return diagnostics,
+    };
+    let target = diagnostic_template_value(
+        &path,
+        text,
+        request_line
+            .trim_start()
+            .strip_prefix("GRPC")
+            .unwrap()
+            .trim(),
+    );
+    if let Err(err) = &target {
+        diagnostics.push(diagnostic_for_line(
+            request_index,
+            request_line,
+            format!("{err:#}"),
+        ));
+    }
+
+    let mut headers = text
+        .lines()
+        .enumerate()
+        .skip(request_index + 1)
+        .take_while(|(_, line)| !line.trim().is_empty())
+        .filter_map(|(index, line)| {
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim();
+            (key.eq_ignore_ascii_case("proto")
+                || key.eq_ignore_ascii_case("protoset"))
+            .then_some((index, line, key, value.trim()))
+        });
+    let Some((index, line, key, value)) = headers.next() else {
+        diagnostics.push(diagnostic_for_line(
+            request_index,
+            request_line,
+            "Missing Proto or Protoset header".to_string(),
+        ));
+        return diagnostics;
+    };
+    if let Some((index, line, _, _)) = headers.next() {
+        diagnostics.push(diagnostic_for_line(
+            index,
+            line,
+            "Specify only one of Proto or Protoset".to_string(),
+        ));
+        return diagnostics;
+    }
+
+    let pool = (|| {
+        let value = diagnostic_template_value(&path, text, value)?;
+        anyhow::ensure!(!value.trim().is_empty(), "Missing {key} file path");
+        let path = resolve_relative(&path, &value);
+        let source = if key.eq_ignore_ascii_case("proto") {
+            DescriptorSource::Proto(path)
+        } else {
+            DescriptorSource::Protoset(path)
+        };
+        load_descriptor_pool(&source)
+            .with_context(|| format!("Invalid {key} descriptors"))
+    })();
+    match pool {
+        Err(err) => diagnostics.push(diagnostic_for_line(
+            index,
+            line,
+            format!("{err:#}"),
+        )),
+        Ok(pool) => {
+            if let Ok(target) = target {
+                if let Err(err) = validate_grpc_target(&pool, &target) {
+                    diagnostics.push(diagnostic_for_line(
+                        request_index,
+                        request_line,
+                        format!("{err:#}"),
+                    ));
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+// Render only static values: never invoke the request renderer, which can
+// prompt, execute shell commands, or acquire OAuth tokens.
+fn diagnostic_template_value(
+    file_path: &Path,
+    text: &str,
+    value: &str,
+) -> Result<String> {
+    if !value.contains("{{") && !value.contains("{%") {
+        return Ok(value.to_string());
+    }
+    let root_dir = find_root_dir(file_path)?
+        .unwrap_or_else(|| file_path.parent().unwrap_or(Path::new(".")).into());
+    let resolved = Resolved {
+        root_dir: root_dir.clone(),
+        resolved_as: ResolvedAs::Simple {
+            path: file_path.into(),
+        },
+    };
+    let scope = crate::env::load_env(&get_target(&root_dir), &resolved, &[])?;
+    let mut environment = minijinja::Environment::new();
+    environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    let mut rendered = value.to_string();
+    for _ in 0..32 {
+        if !rendered.contains("{{") && !rendered.contains("{%") {
+            return Ok(rendered);
+        }
+        let mut values = HashMap::new();
+        for occurrence in variable_occurrences(&rendered) {
+            let local = find_local_variable_definitions(text, &occurrence.key)
+                .into_iter()
+                .last()
+                .and_then(|definition| definition.value);
+            let replacement = if let Some(local) = local {
+                toml_value_display(&local)
+            } else {
+                match scope.lookup(&occurrence.key)? {
+                    Replacement::Value(value) => value,
+                    Replacement::ValueNotFound { key } => {
+                        anyhow::bail!("No value found for {{{{{key}}}}}")
+                    }
+                    Replacement::MultipleValuesFound { key, .. } => {
+                        anyhow::bail!("Multiple values found for {{{{{key}}}}}")
+                    }
+                }
+            };
+            values.insert(occurrence.key, replacement);
+        }
+        rendered = environment.render_str(&rendered, values)?;
+    }
+    anyhow::bail!("Template expansion limit exceeded (possible cyclic variable reference)")
+}
+
+fn validate_grpc_target(
+    pool: &prost_reflect::DescriptorPool,
+    target: &str,
+) -> Result<()> {
+    let target = target.split_once("://").map_or(target, |(_, rest)| rest);
+    let (host, path) = target
+        .split_once('/')
+        .context("Invalid gRPC target: expected host/package.Service/Method")?;
+    anyhow::ensure!(!host.is_empty(), "Invalid gRPC target: missing host");
+    let (service_name, method_name) = path
+        .rsplit_once('/')
+        .context("Invalid gRPC path: expected /package.Service/Method")?;
+    let service = pool
+        .get_service_by_name(service_name)
+        .with_context(|| format!("gRPC service not found: {service_name}"))?;
+    anyhow::ensure!(
+        service.methods().any(|method| method.name() == method_name),
+        "gRPC method not found: {service_name}/{method_name}"
+    );
+    Ok(())
+}
+
 fn descriptor_source(file_path: &Path, text: &str) -> Result<DescriptorSource> {
     for line in text.lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -1755,6 +2035,278 @@ mod tests {
         fs::write(&request, &text).unwrap();
 
         (tmp, request, text)
+    }
+
+    #[test]
+    fn completes_grpc_methods_without_a_body() {
+        let (_tmp, request, _) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        for header in ["Protoset: ./protoset.bin", "Proto: ./add.proto"] {
+            let line = "GRPC localhost:50051/addsvc.Add/";
+            let text = format!("{line}\n{header}\n");
+            let completion = completion_for_position(
+                &uri,
+                &text,
+                Position::new(0, line.len() as u32),
+            )
+            .unwrap()
+            .unwrap();
+            let CompletionResponse::Array(items) = completion else {
+                panic!("expected method completions");
+            };
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Sum", "Concat"]
+            );
+            assert!(items
+                .iter()
+                .all(|item| item.kind == Some(CompletionItemKind::METHOD)));
+        }
+    }
+
+    #[test]
+    fn method_completion_replaces_entire_partial_or_invalid_method() {
+        let (_tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        for name in ["Su", "UnknownMethod", "Sum"] {
+            let text = text.replace("/Sum", &format!("/{name}"));
+            let line = text.lines().next().unwrap();
+            let start = line.rfind('/').unwrap() + 1;
+            // Complete with the cursor in the middle, replacing the suffix too.
+            let completion = completion_for_position(
+                &uri,
+                &text,
+                Position::new(0, start as u32 + 1),
+            )
+            .unwrap()
+            .unwrap();
+            let CompletionResponse::Array(items) = completion else {
+                panic!("expected method completions");
+            };
+            let item =
+                items.iter().find(|item| item.label == "Concat").unwrap();
+            let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+                panic!("expected method edit");
+            };
+            assert_eq!(
+                edit.range,
+                Range::new(
+                    Position::new(0, start as u32),
+                    Position::new(0, line.len() as u32)
+                )
+            );
+            assert_eq!(edit.new_text, "Concat");
+            assert!(item.command.is_none());
+            assert!(item.additional_text_edits.is_none());
+        }
+    }
+
+    #[test]
+    fn completes_grpc_methods_with_config_and_unsaved_local_variables() {
+        let (tmp, request, _) = grpc_fixture();
+        fs::write(
+            tmp.join("hitman.toml"),
+            "[default]\nservice_url = 'https://localhost:50051/addsvc.Add'\n",
+        )
+        .unwrap();
+        let uri = Url::from_file_path(request).unwrap();
+        for prefix in
+            ["", "@service_url = grpcs://localhost:50051/addsvc.Add\n\n"]
+        {
+            let line = "GRPC {{service_url}}/";
+            let text =
+                format!("{prefix}{line}\nProtoset: ./protoset.bin\n\n{{}}\n");
+            let line_index = prefix.lines().count() as u32;
+            let completion = completion_for_position(
+                &uri,
+                &text,
+                Position::new(line_index, line.len() as u32),
+            )
+            .unwrap()
+            .unwrap();
+            let CompletionResponse::Array(items) = completion else {
+                panic!("expected method completions");
+            };
+            assert_eq!(items.len(), 2);
+        }
+    }
+
+    #[test]
+    fn method_completion_ignores_host_service_and_header_positions() {
+        let (_tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        for position in [
+            Position::new(0, 10),
+            Position::new(0, 23),
+            Position::new(1, 10),
+        ] {
+            assert!(completion_for_position(&uri, &text, position)
+                .unwrap()
+                .is_none());
+        }
+        let text = text.replace("addsvc.Add", "missing.Service");
+        assert!(completion_for_position(
+            &uri,
+            &text,
+            Position::new(0, text.lines().next().unwrap().len() as u32)
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn grpc_diagnostics_accept_valid_descriptors_and_methods() {
+        let (_tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        assert!(diagnostics_for_document(&uri, &text).is_empty());
+        assert!(diagnostics_for_document(
+            &uri,
+            &text.replace("Protoset: ./protoset.bin", "Proto: ./add.proto")
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn grpc_diagnostics_report_unknown_method_and_service_on_request_line() {
+        let (_tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        for (text, message) in [
+            (
+                text.replace("/Sum", "/UnknownMethod"),
+                "gRPC method not found: addsvc.Add/UnknownMethod",
+            ),
+            (
+                text.replace("addsvc.Add", "missing.Service"),
+                "gRPC service not found: missing.Service",
+            ),
+            (
+                text.replace("/addsvc.Add/Sum", "/UnknownMethod"),
+                "Invalid gRPC path",
+            ),
+        ] {
+            let diagnostics = diagnostics_for_document(&uri, &text);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].range.start.line, 0);
+            assert_eq!(
+                diagnostics[0].severity,
+                Some(DiagnosticSeverity::ERROR)
+            );
+            assert!(
+                diagnostics[0].message.contains(message),
+                "{}",
+                diagnostics[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_diagnostics_resolve_target_variables_from_config_and_unsaved_locals(
+    ) {
+        let (tmp, request, text) = grpc_fixture();
+        fs::write(
+            tmp.join("hitman.toml"),
+            "[default]\nservice_url = 'localhost:50051/addsvc.Add'\n",
+        )
+        .unwrap();
+        let uri = Url::from_file_path(request).unwrap();
+        let text = text.replace("grpcb.in:9001/addsvc.Add", "{{service_url}}");
+        assert!(diagnostics_for_document(&uri, &text).is_empty());
+        let diagnostics = diagnostics_for_document(
+            &uri,
+            &text.replace("/Sum", "/UnknownMethod"),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("gRPC method not found"));
+        let text =
+            format!("@service_url = localhost:50051/addsvc.Add\n\n{text}");
+        fs::remove_file(tmp.join("hitman.toml")).unwrap();
+        assert!(diagnostics_for_document(&uri, &text).is_empty());
+    }
+
+    #[test]
+    fn grpc_diagnostics_report_missing_variables_and_invalid_descriptors_independently(
+    ) {
+        let (tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        fs::write(tmp.join("protoset.bin"), "not a descriptor set").unwrap();
+        let text = text.replace("grpcb.in:9001/addsvc.Add", "{{service_url}}");
+        let diagnostics = diagnostics_for_document(&uri, &text);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].range.start.line, 0);
+        assert!(diagnostics[0]
+            .message
+            .contains("No value found for {{service_url}}"));
+        assert_eq!(diagnostics[1].range.start.line, 1);
+        assert!(diagnostics[1]
+            .message
+            .contains("Invalid Protoset descriptors"));
+    }
+
+    #[test]
+    fn grpc_diagnostics_report_invalid_missing_and_duplicate_descriptor_headers(
+    ) {
+        let (tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        fs::write(tmp.join("broken.proto"), "invalid proto").unwrap();
+        for header in [
+            "Proto: broken.proto",
+            "Protoset: missing.bin",
+            "Protoset:",
+            "Protoset: {{missing}}",
+        ] {
+            let diagnostics = diagnostics_for_document(
+                &uri,
+                &text.replace("Protoset: ./protoset.bin", header),
+            );
+            assert_eq!(diagnostics.len(), 1, "{header}");
+            assert_eq!(diagnostics[0].range.start.line, 1);
+        }
+        let diagnostics = diagnostics_for_document(
+            &uri,
+            "GRPC localhost:50051/addsvc.Add/Sum\n\n{}",
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "Missing Proto or Protoset header");
+        let diagnostics = diagnostics_for_document(
+            &uri,
+            &text.replace(
+                "Protoset: ./protoset.bin",
+                "Protoset: ./protoset.bin\nProto: add.proto",
+            ),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, 2);
+    }
+
+    #[test]
+    fn grpc_diagnostics_clear_after_fix_and_ignore_http_requests() {
+        let (_tmp, request, text) = grpc_fixture();
+        let uri = Url::from_file_path(request).unwrap();
+        assert!(!diagnostics_for_document(
+            &uri,
+            &text.replace("/Sum", "/Missing")
+        )
+        .is_empty());
+        assert!(diagnostics_for_document(&uri, &text).is_empty());
+        assert!(diagnostics_for_document(&uri, "GET {{url}}\n\n{}").is_empty());
+    }
+
+    #[test]
+    fn grpc_diagnostics_resolve_nested_variables_and_bound_cycles() {
+        let (tmp, request, text) = grpc_fixture();
+        fs::write(tmp.join("hitman.toml"), "[default]\nhost = 'localhost:50051'\nservice_url = '{{host}}/addsvc.Add'\ncycle = '{{cycle}}'\n").unwrap();
+        let uri = Url::from_file_path(request).unwrap();
+        let text = text.replace("grpcb.in:9001/addsvc.Add", "{{service_url}}");
+        assert!(diagnostics_for_document(&uri, &text).is_empty());
+        let diagnostics = diagnostics_for_document(
+            &uri,
+            &text.replace("service_url", "cycle"),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("cyclic variable reference"));
     }
 
     fn grpc_completion_fixture(body: &str) -> (Temp, PathBuf, String) {
