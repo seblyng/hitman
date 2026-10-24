@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use toml::{Table as TomlTable, Value as TomlValue};
-use toml_edit::{ImDocument, Item as TomlEditItem, Table as TomlEditTable};
+use toml_edit::{Document, Item as TomlEditItem, Table as TomlEditTable};
 use tower_lsp::{
     async_trait,
     jsonrpc::Result as LspResult,
@@ -1386,7 +1386,7 @@ fn find_toml_key_definitions(
 ) -> Vec<TomlKeyDefinition> {
     let mut definitions = Vec::new();
 
-    let Ok(document) = ImDocument::parse(text) else {
+    let Ok(document) = Document::parse(text) else {
         return definitions;
     };
     let root = document.as_table();

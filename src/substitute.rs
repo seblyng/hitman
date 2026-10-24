@@ -7,7 +7,8 @@ use std::{
     thread,
 };
 
-use minijinja::value::{Enumerator, ObjectRepr};
+use minijinja::syntax::SyntaxConfig;
+use minijinja::value::{Enumerator, ObjectRepr, Serde};
 use minijinja::{
     path_loader, value::Object, Environment, Error, ErrorKind, UndefinedBehavior, Value,
 };
@@ -144,7 +145,7 @@ impl Object for SingleSelect {
 
     // Allow Jinja built-ins like 'for' and 'map' on the entire list
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        let values = self.values.iter().map(Value::from_serialize).collect();
+        let values = self.values.iter().map(|v| Value::from(Serde(v))).collect();
         Enumerator::Values(values)
     }
 
@@ -176,6 +177,22 @@ impl Object for MultiSelect {
             Enumerator::NonEnumerable
         }
     }
+
+    fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let values = self
+            .provider
+            .select_multiple(&self.key, &self.values)
+            .map_err(|_| fmt::Error)?;
+        write!(f, "[")?;
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            let json = serde_json::to_string(value).map_err(|_| fmt::Error)?;
+            write!(f, "{json}")?;
+        }
+        write!(f, "]")
+    }
 }
 
 pub fn substitute(
@@ -203,7 +220,11 @@ pub fn substitute_with_locals(
 
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
-    env.set_keep_trailing_newline(true);
+    env.set_syntax(
+        SyntaxConfig::builder()
+            .keep_trailing_newline(true)
+            .build()?,
+    );
     env.set_loader(path_loader(working_dir));
 
     let function_working_dir = working_dir.to_owned();
@@ -385,10 +406,10 @@ mod tests {
         );
         vars.insert(
             "label".to_string(),
-            Single(Value::from_serialize(vec![
+            Single(Value::from(Serde(vec![
                 serde_json::json!({"value": "bug", "name": "bug"}),
                 serde_json::json!({"value": "docs", "name": "documentation"}),
-            ])),
+            ]))),
         );
 
         vars
