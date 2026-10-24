@@ -1,6 +1,5 @@
 use log::{
-    set_boxed_logger, set_max_level, Level, LevelFilter, Log, Metadata, Record,
-    SetLoggerError,
+    set_boxed_logger, set_max_level, Level, LevelFilter, Log, Metadata, Record, SetLoggerError,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -48,11 +47,7 @@ impl Log for Logger {
     }
 }
 
-pub fn init(
-    verbose: bool,
-    quiet: bool,
-    is_flurry: bool,
-) -> Result<(), SetLoggerError> {
+pub fn init(verbose: bool, quiet: bool, is_flurry: bool) -> Result<(), SetLoggerError> {
     let logger = Logger {
         level: match (verbose, quiet, is_flurry) {
             (_, true, _) => Level::Error,

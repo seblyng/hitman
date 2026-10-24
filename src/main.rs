@@ -7,8 +7,7 @@ use std::env::current_dir;
 use tokio::sync::mpsc;
 
 use hitman::env::{
-    find_available_requests, get_target, load_env, select_target, set_target,
-    watch_list,
+    find_available_requests, get_target, load_env, select_target, set_target, watch_list,
 };
 use hitman::flurry::flurry_attack;
 use hitman::monitor::monitor;
@@ -35,8 +34,7 @@ async fn main() -> Result<()> {
     set_interactive_mode(!(args.non_interactive || args.watch));
 
     if let Some(arg) = args.select {
-        let root_dir =
-            find_root_dir(&current_dir()?)?.context("No hitman.toml found")?;
+        let root_dir = find_root_dir(&current_dir()?)?.context("No hitman.toml found")?;
 
         match arg {
             Some(target) => set_target(&root_dir, &target)?,
@@ -134,21 +132,13 @@ fn is_user_cancelation(err: &anyhow::Error) -> bool {
     )
 }
 
-async fn run_once(
-    target: &str,
-    resolved: &Resolved,
-    options: &[(String, String)],
-) -> Result<()> {
+async fn run_once(target: &str, resolved: &Resolved, options: &[(String, String)]) -> Result<()> {
     let scope = load_env(target, resolved, options)?;
 
     make_request(resolved, target, &scope).await
 }
 
-async fn watch_mode(
-    target: &str,
-    resolved: &Resolved,
-    options: &[(String, String)],
-) -> Result<()> {
+async fn watch_mode(target: &str, resolved: &Resolved, options: &[(String, String)]) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(1);
 
     let paths = watch_list(&resolved.root_dir, resolved);

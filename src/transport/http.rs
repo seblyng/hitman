@@ -1,13 +1,11 @@
-use std::{
-    fmt::Display, path::Path, str, str::FromStr, sync::Arc, time::Duration,
-};
+use std::{fmt::Display, path::Path, str, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use httparse::Status;
-use log::{Level, info, log_enabled};
+use log::{info, log_enabled, Level};
 use reqwest::{
-    Client, Method, Response, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
+    Client, Method, Response, Url,
 };
 use serde_json::Value;
 use std::fmt::Write;
@@ -65,8 +63,7 @@ impl Display for HttpRequest {
     }
 }
 
-static USER_AGENT: &str =
-    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+static USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
 pub fn build_client(root_dir: &Path) -> Result<Client> {
     let client = Client::builder()
@@ -93,9 +90,7 @@ pub fn prepare_request(input: &str) -> Result<HttpRequest> {
     let url = Url::parse(url)?;
 
     let body = match parse_result {
-        Status::Complete(offset) => {
-            Some(HttpBody::new(input[offset..].to_string()))
-        }
+        Status::Complete(offset) => Some(HttpBody::new(input[offset..].to_string())),
         Status::Partial => None,
     };
 
@@ -167,15 +162,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(request.body.unwrap().into_string(), "{\n  \"text\": \"# not a comment\"\n}\n");
+        assert_eq!(
+            request.body.unwrap().into_string(),
+            "{\n  \"text\": \"# not a comment\"\n}\n"
+        );
         assert_eq!(request.headers["content-type"], "application/json");
     }
 }
 
-pub async fn send(
-    client: &Client,
-    req: &HttpRequest,
-) -> Result<(Response, Duration)> {
+pub async fn send(client: &Client, req: &HttpRequest) -> Result<(Response, Duration)> {
     do_request(client, req).await
 }
 
@@ -190,10 +185,7 @@ pub async fn finish_response(response: Response) -> Result<Option<Value>> {
     Ok(json)
 }
 
-pub async fn do_request(
-    client: &Client,
-    req: &HttpRequest,
-) -> Result<(Response, Duration)> {
+pub async fn do_request(client: &Client, req: &HttpRequest) -> Result<(Response, Duration)> {
     let mut builder = client.request(req.method.clone(), req.url.clone());
     builder = builder.headers(req.headers.clone());
     if let Some(ref body) = req.body {

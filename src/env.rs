@@ -51,17 +51,14 @@ impl CookieStore for HitmanCookieJar {
     }
 
     fn cookies(&self, _: &Url) -> Option<reqwest::header::HeaderValue> {
-        let data_file =
-            read_toml(&self.root_dir.join(DATA_FILE)).ok().flatten()?;
+        let data_file = read_toml(&self.root_dir.join(DATA_FILE)).ok().flatten()?;
 
         match data_file.get(COOKIE_KEY)? {
             Value::Array(arr) => {
                 let headers = arr
                     .iter()
                     .filter_map(|it| cookie::Cookie::parse(it.as_str()?).ok())
-                    .map(|cookie| {
-                        format!("{}={}", cookie.name(), cookie.value())
-                    })
+                    .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
                     .collect::<Vec<_>>()
                     .join("; ");
 
@@ -119,11 +116,7 @@ pub fn watch_list(root_dir: &Path, resolved: &Resolved) -> Vec<PathBuf> {
     ]
 }
 
-pub fn load_env(
-    target: &str,
-    resolved: &Resolved,
-    options: &[(String, String)],
-) -> Result<Scope> {
+pub fn load_env(target: &str, resolved: &Resolved, options: &[(String, String)]) -> Result<Scope> {
     use Value::Table;
 
     let mut table = TomlTable::new();
@@ -168,8 +161,7 @@ pub fn update_data(root_dir: &Path, vars: &TomlTable) -> Result<()> {
 
     let data_file = root_dir.join(DATA_FILE);
 
-    let content =
-        fs::read_to_string(&data_file).unwrap_or_else(|_| String::default());
+    let content = fs::read_to_string(&data_file).unwrap_or_else(|_| String::default());
 
     let mut state = toml::from_str::<TomlTable>(&content).unwrap_or_default();
 
@@ -243,8 +235,7 @@ pub fn find_available_requests(cwd: &Path) -> Result<Vec<PathBuf>> {
         .map(|p| {
             // Convert to relative path, based on depth
             let components: Vec<_> = p.path().components().collect();
-            let relative_components: Vec<_> = components
-                [(components.len() - p.depth())..]
+            let relative_components: Vec<_> = components[(components.len() - p.depth())..]
                 .iter()
                 .map(|c| c.as_os_str())
                 .collect();

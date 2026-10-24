@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap, fs::read_to_string, path::Path, sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fs::read_to_string, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use reqwest::Client;
@@ -46,48 +43,41 @@ pub fn prepare_request(
     let input = read_to_string(resolved.http_file())?;
     let working_dir = resolved.http_file().parent().unwrap_or(Path::new("."));
     let (template, local_values) = parse_local_variables(&input)?;
-    let rendered = substitute::substitute_with_locals(
-        &template,
-        provider.clone(),
-        working_dir,
-        local_values,
-    )?;
+    let rendered =
+        substitute::substitute_with_locals(&template, provider.clone(), working_dir, local_values)?;
 
     match &resolved.resolved_as {
-        ResolvedAs::Simple { .. } if grpc::is_grpc_request(&rendered) => Ok(
-            PreparedRequest::Grpc(grpc::prepare_request(resolved, &rendered)?),
-        ),
-        ResolvedAs::Simple { .. } => {
-            Ok(PreparedRequest::Http(http::prepare_request(&rendered)?))
-        }
-        ResolvedAs::GraphQL { .. } => Ok(PreparedRequest::GraphQL(
-            graphql::prepare_request(resolved, &rendered, provider)?,
+        ResolvedAs::Simple { .. } if grpc::is_grpc_request(&rendered) => Ok(PreparedRequest::Grpc(
+            grpc::prepare_request(resolved, &rendered)?,
         )),
+        ResolvedAs::Simple { .. } => Ok(PreparedRequest::Http(http::prepare_request(&rendered)?)),
+        ResolvedAs::GraphQL { .. } => Ok(PreparedRequest::GraphQL(graphql::prepare_request(
+            resolved, &rendered, provider,
+        )?)),
     }
 }
 
-fn parse_local_variables(
-    input: &str,
-) -> Result<(String, HashMap<String, minijinja::Value>)> {
+fn parse_local_variables(input: &str) -> Result<(String, HashMap<String, minijinja::Value>)> {
     let mut values = HashMap::new();
     let mut body_start = 0;
     let mut declarations_started = false;
 
     for line in input.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        let declaration = trimmed.split_once('#').map_or(trimmed, |(before, _)| before).trim_end();
+        let declaration = trimmed
+            .split_once('#')
+            .map_or(trimmed, |(before, _)| before)
+            .trim_end();
         if declaration.starts_with('@') {
             declarations_started = true;
-            let (key, value) = declaration[1..]
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("Invalid variable declaration `{declaration}`; expected `@name = value`"))?;
+            let (key, value) = declaration[1..].split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid variable declaration `{declaration}`; expected `@name = value`"
+                )
+            })?;
             let key = key.trim();
-            if key.is_empty()
-                || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                anyhow::bail!(
-                    "Invalid variable name `{key}` in declaration `{declaration}`"
-                );
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                anyhow::bail!("Invalid variable name `{key}` in declaration `{declaration}`");
             }
             values.insert(
                 key.to_string(),
@@ -132,8 +122,7 @@ mod tests {
 
     #[test]
     fn leaves_request_unchanged_without_leading_declarations() {
-        let input =
-            "GET https://example.com HTTP/1.1\n@not_a_declaration = value\n";
+        let input = "GET https://example.com HTTP/1.1\n@not_a_declaration = value\n";
         let (body, values) = parse_local_variables(input).unwrap();
 
         assert_eq!(body, input);
@@ -142,16 +131,11 @@ mod tests {
 
     #[test]
     fn rejects_malformed_leading_declaration() {
-        assert!(
-            parse_local_variables("@missing_equals\nGET / HTTP/1.1\n").is_err()
-        );
+        assert!(parse_local_variables("@missing_equals\nGET / HTTP/1.1\n").is_err());
     }
 }
 
-pub async fn send(
-    client: &Client,
-    request: &PreparedRequest,
-) -> Result<TransportResponse> {
+pub async fn send(client: &Client, request: &PreparedRequest) -> Result<TransportResponse> {
     match request {
         PreparedRequest::Http(req) => {
             let (response, elapsed) = http::send(client, req).await?;
@@ -177,16 +161,10 @@ pub async fn send(
     }
 }
 
-pub async fn finish_response(
-    response: TransportResponse,
-) -> Result<ExecutionResult> {
+pub async fn finish_response(response: TransportResponse) -> Result<ExecutionResult> {
     let json = match response.response {
-        TransportResponseBody::Http(response) => {
-            http::finish_response(response).await?
-        }
-        TransportResponseBody::GraphQL(response) => {
-            graphql::finish_response(response).await?
-        }
+        TransportResponseBody::Http(response) => http::finish_response(response).await?,
+        TransportResponseBody::GraphQL(response) => graphql::finish_response(response).await?,
         TransportResponseBody::Grpc(json) => grpc::finish_response(&json)?,
     };
 

@@ -1,9 +1,7 @@
 use std::{fmt::Display, path::Path, sync::Arc};
 
 use anyhow::{bail, Result};
-use graphql_parser::query::{
-    Definition, OperationDefinition, VariableDefinition,
-};
+use graphql_parser::query::{Definition, OperationDefinition, VariableDefinition};
 use reqwest::{header::CONTENT_TYPE, Client};
 use serde_json::{json, Value};
 
@@ -58,9 +56,7 @@ pub async fn send(
     http::do_request(client, &req.http).await
 }
 
-pub async fn finish_response(
-    response: reqwest::Response,
-) -> Result<Option<Value>> {
+pub async fn finish_response(response: reqwest::Response) -> Result<Option<Value>> {
     http::print_response(&response)?;
 
     if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
@@ -111,9 +107,7 @@ fn resolve_variables(
         let value = match provider.lookup_value(&key.name) {
             None => serde_json::to_value(provider.prompt(&key.name, None)?),
             Some(SubstituteValue::Single(value)) => serde_json::to_value(value),
-            Some(SubstituteValue::Multiple(values)) => {
-                serde_json::to_value(values)
-            }
+            Some(SubstituteValue::Multiple(values)) => serde_json::to_value(values),
         }?;
 
         map.insert(key.name, value);
@@ -133,10 +127,7 @@ where
         vars.iter()
             .map(|d| GraphQLVariable {
                 name: d.name.clone(),
-                list: matches!(
-                    d.var_type,
-                    graphql_parser::query::Type::ListType(_)
-                ),
+                list: matches!(d.var_type, graphql_parser::query::Type::ListType(_)),
             })
             .collect::<Vec<_>>()
     };
@@ -144,13 +135,9 @@ where
     let args = match doc.definitions.first() {
         Some(Definition::Operation(ref op)) => match op {
             OperationDefinition::Query(q) => variables(&q.variable_definitions),
-            OperationDefinition::Mutation(m) => {
-                variables(&m.variable_definitions)
-            }
+            OperationDefinition::Mutation(m) => variables(&m.variable_definitions),
             OperationDefinition::SelectionSet(_) => bail!("Not supported"),
-            OperationDefinition::Subscription(s) => {
-                variables(&s.variable_definitions)
-            }
+            OperationDefinition::Subscription(s) => variables(&s.variable_definitions),
         },
         _ => bail!("Not supported"),
     };

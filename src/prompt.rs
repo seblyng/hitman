@@ -49,9 +49,7 @@ pub fn fuzzy_match(filter: &str, value: &str) -> Option<i64> {
     fuzzy_score.map(|(score, _)| score)
 }
 
-pub fn get_interaction(
-    scope: Scope,
-) -> Arc<dyn SubstituteProvider + Send + Sync + 'static> {
+pub fn get_interaction(scope: Scope) -> Arc<dyn SubstituteProvider + Send + Sync + 'static> {
     if is_interactive_mode() {
         Arc::new(CliUserInteraction::new(scope))
     } else {
@@ -85,9 +83,7 @@ impl SubstituteProvider for NoUserInteraction {
     fn lookup_value(&self, key: &str) -> Option<SubstituteValue> {
         match self.scope.lookup(key).ok()? {
             Replacement::ValueNotFound { .. } => None,
-            Replacement::Value(v) => {
-                Some(SubstituteValue::Single(JinjaValue::from(v)))
-            }
+            Replacement::Value(v) => Some(SubstituteValue::Single(JinjaValue::from(v))),
             Replacement::MultipleValuesFound { key: _, values } => {
                 Some(SubstituteValue::Multiple(values))
             }
@@ -101,20 +97,12 @@ impl SubstituteProvider for NoUserInteraction {
         bail!("Replacement not found: {key}");
     }
 
-    fn select_single(
-        &self,
-        key: &str,
-        values: &[toml::Value],
-    ) -> Result<JinjaValue> {
+    fn select_single(&self, key: &str, values: &[toml::Value]) -> Result<JinjaValue> {
         let suggestions = self.get_suggestions(key, values);
         bail!("Replacement not selected: {key}\nSuggestions:\n{suggestions}");
     }
 
-    fn select_multiple(
-        &self,
-        key: &str,
-        values: &[toml::Value],
-    ) -> Result<Vec<JinjaValue>> {
+    fn select_multiple(&self, key: &str, values: &[toml::Value]) -> Result<Vec<JinjaValue>> {
         let suggestions = self.get_suggestions(key, values);
         bail!("Replacement not selected: {key}\nSuggestions:\n{suggestions}");
     }
@@ -142,9 +130,7 @@ impl SubstituteProvider for CliUserInteraction {
 
         match self.scope.lookup(key).ok()? {
             Replacement::ValueNotFound { .. } => None,
-            Replacement::Value(v) => {
-                Some(SubstituteValue::Single(JinjaValue::from(v)))
-            }
+            Replacement::Value(v) => Some(SubstituteValue::Single(JinjaValue::from(v))),
             Replacement::MultipleValuesFound { key: _, values } => {
                 Some(SubstituteValue::Multiple(values))
             }
@@ -155,24 +141,15 @@ impl SubstituteProvider for CliUserInteraction {
         let value = prompt_user_value(key, fallback)?;
 
         let mut vars_mut = self.vars.write().unwrap();
-        vars_mut
-            .insert(key.to_string(), SubstituteValue::Single(value.clone()));
+        vars_mut.insert(key.to_string(), SubstituteValue::Single(value.clone()));
         Ok(value)
     }
 
-    fn select_single(
-        &self,
-        key: &str,
-        values: &[toml::Value],
-    ) -> Result<JinjaValue> {
+    fn select_single(&self, key: &str, values: &[toml::Value]) -> Result<JinjaValue> {
         select_replacement(key, values)
     }
 
-    fn select_multiple(
-        &self,
-        key: &str,
-        values: &[toml::Value],
-    ) -> Result<Vec<JinjaValue>> {
+    fn select_multiple(&self, key: &str, values: &[toml::Value]) -> Result<Vec<JinjaValue>> {
         select_replacement_multiple(key, values)
     }
 }
@@ -223,18 +200,14 @@ impl Object for SelectedDate {
         self.field(key.as_str()?)
     }
 
-    fn render(
-        self: &Arc<Self>,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.format("%Y-%m-%d"))
     }
 }
 
 fn prompt_for_selected_date(key: &str) -> Result<Option<chrono::NaiveDate>> {
     let msg = format!("Select a date for {key}");
-    let formatter =
-        |date: chrono::NaiveDate| date.format("%Y-%m-%d").to_string();
+    let formatter = |date: chrono::NaiveDate| date.format("%Y-%m-%d").to_string();
 
     let res = DateSelect::new(&msg)
         .with_week_start(chrono::Weekday::Mon)
@@ -246,33 +219,26 @@ fn prompt_for_selected_date(key: &str) -> Result<Option<chrono::NaiveDate>> {
 
 fn select_replacement(key: &str, values: &[Value]) -> Result<JinjaValue> {
     let list_options = values_to_list_options(values);
-    let selected =
-        Select::new(&format!("Select value for {key}"), list_options)
-            .with_scorer(&|filter, _, value, _| fuzzy_match(filter, value))
-            .with_page_size(15)
-            .prompt()?;
+    let selected = Select::new(&format!("Select value for {key}"), list_options)
+        .with_scorer(&|filter, _, value, _| fuzzy_match(filter, value))
+        .with_page_size(15)
+        .prompt()?;
 
     Ok(JinjaValue::from(list_option_to_string(
         key, values, &selected,
     )?))
 }
 
-fn select_replacement_multiple(
-    key: &str,
-    values: &[Value],
-) -> Result<Vec<JinjaValue>> {
+fn select_replacement_multiple(key: &str, values: &[Value]) -> Result<Vec<JinjaValue>> {
     let list_options = values_to_list_options(values);
-    let selected =
-        MultiSelect::new(&format!("Select value for {key}"), list_options)
-            .with_scorer(&|filter, _, value, _| fuzzy_match(filter, value))
-            .with_page_size(15)
-            .prompt()?;
+    let selected = MultiSelect::new(&format!("Select value for {key}"), list_options)
+        .with_scorer(&|filter, _, value, _| fuzzy_match(filter, value))
+        .with_page_size(15)
+        .prompt()?;
 
     let values = selected
         .iter()
-        .map(|item| {
-            list_option_to_string(key, values, item).map(JinjaValue::from)
-        })
+        .map(|item| list_option_to_string(key, values, item).map(JinjaValue::from))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(values)
@@ -353,8 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_true_if_value_contains_all_letters_in_filter_in_the_same_order()
-    {
+    fn returns_true_if_value_contains_all_letters_in_filter_in_the_same_order() {
         assert!(fuzzy_match("abc", "uaaxbycz").is_some());
     }
 }

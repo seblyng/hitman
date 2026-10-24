@@ -9,8 +9,7 @@ use std::{
 
 use minijinja::value::{Enumerator, ObjectRepr};
 use minijinja::{
-    path_loader, value::Object, Environment, Error, ErrorKind,
-    UndefinedBehavior, Value,
+    path_loader, value::Object, Environment, Error, ErrorKind, UndefinedBehavior, Value,
 };
 
 #[derive(Debug, Clone)]
@@ -21,21 +20,9 @@ pub enum SubstituteValue {
 
 pub trait SubstituteProvider {
     fn lookup_value(&self, key: &str) -> Option<SubstituteValue>;
-    fn prompt(
-        &self,
-        key: &str,
-        fallback: Option<&str>,
-    ) -> anyhow::Result<Value>;
-    fn select_single(
-        &self,
-        key: &str,
-        values: &[toml::Value],
-    ) -> anyhow::Result<Value>;
-    fn select_multiple(
-        &self,
-        key: &str,
-        values: &[toml::Value],
-    ) -> anyhow::Result<Vec<Value>>;
+    fn prompt(&self, key: &str, fallback: Option<&str>) -> anyhow::Result<Value>;
+    fn select_single(&self, key: &str, values: &[toml::Value]) -> anyhow::Result<Value>;
+    fn select_multiple(&self, key: &str, values: &[toml::Value]) -> anyhow::Result<Vec<Value>>;
 }
 
 impl fmt::Debug for dyn SubstituteProvider + Send + Sync {
@@ -134,10 +121,7 @@ impl Object for PendingValue {
             .field(field)
     }
 
-    fn render(
-        self: &Arc<Self>,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = self
             .provider
             .prompt(&self.key, self.fallback.as_deref())
@@ -164,10 +148,7 @@ impl Object for SingleSelect {
         Enumerator::Values(values)
     }
 
-    fn render(
-        self: &Arc<Self>,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = self
             .provider
             .select_single(&self.key, &self.values)
@@ -189,9 +170,7 @@ impl Object for MultiSelect {
     }
 
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        if let Ok(values) =
-            self.provider.select_multiple(&self.key, &self.values)
-        {
+        if let Ok(values) = self.provider.select_multiple(&self.key, &self.values) {
             Enumerator::Values(values)
         } else {
             Enumerator::NonEnumerable
@@ -258,9 +237,7 @@ pub fn substitute_with_locals(
         if let Some(obj) = v.downcast_object_ref::<SingleSelect>() {
             select_one_provider
                 .select_single(&obj.key, &obj.values)
-                .map_err(|error| {
-                    Error::new(ErrorKind::InvalidOperation, error.to_string())
-                })
+                .map_err(|error| Error::new(ErrorKind::InvalidOperation, error.to_string()))
         } else {
             Ok(v)
         }
@@ -279,11 +256,7 @@ pub fn substitute_with_locals(
     Ok(env.render_str(input, ctx_val)?)
 }
 
-fn run_shell(
-    command: &str,
-    input: Option<String>,
-    working_dir: &Path,
-) -> Result<String, Error> {
+fn run_shell(command: &str, input: Option<String>, working_dir: &Path) -> Result<String, Error> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -336,8 +309,7 @@ fn run_shell(
         return Err(Error::new(ErrorKind::InvalidOperation, message));
     }
 
-    String::from_utf8(output.stdout)
-        .map_err(|error| shell_error(command, error))
+    String::from_utf8(output.stdout).map_err(|error| shell_error(command, error))
 }
 
 fn shell_error(command: &str, error: impl fmt::Display) -> Error {
@@ -364,17 +336,11 @@ mod tests {
             self.vars.get(key).cloned()
         }
 
-        fn prompt(
-            &self,
-            key: &str,
-            fallback: Option<&str>,
-        ) -> anyhow::Result<Value> {
+        fn prompt(&self, key: &str, fallback: Option<&str>) -> anyhow::Result<Value> {
             if key == "endDate" {
-                return Ok(Value::from_object(
-                    crate::prompt::SelectedDate::new(
-                        chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
-                    ),
-                ));
+                return Ok(Value::from_object(crate::prompt::SelectedDate::new(
+                    chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+                )));
             }
             if let Some(fb) = fallback {
                 Ok(Value::from(format!("[fallback: {fb}]")))
@@ -383,11 +349,7 @@ mod tests {
             }
         }
 
-        fn select_single(
-            &self,
-            key: &str,
-            values: &[toml::Value],
-        ) -> anyhow::Result<Value> {
+        fn select_single(&self, key: &str, values: &[toml::Value]) -> anyhow::Result<Value> {
             if let Some(v) = values.first() {
                 Ok(Value::from(v.as_str()))
             } else {
@@ -484,9 +446,7 @@ mod tests {
     #[test]
     fn substitutes_placeholder_with_default_value() {
         let provider = create_provider();
-        let res =
-            render("foo: {{ url | fallback('fallback.com') }}\n", provider)
-                .unwrap();
+        let res = render("foo: {{ url | fallback('fallback.com') }}\n", provider).unwrap();
 
         assert_eq!(res, "foo: example.com\n".to_string());
     }
@@ -494,9 +454,7 @@ mod tests {
     #[test]
     fn substitutes_default_value() {
         let provider = create_provider();
-        let res =
-            render("foo: {{ href | fallback('fallback.com') }}\n", provider)
-                .unwrap();
+        let res = render("foo: {{ href | fallback('fallback.com') }}\n", provider).unwrap();
 
         assert_eq!(res, "foo: [fallback: fallback.com]\n".to_string());
     }
@@ -544,9 +502,7 @@ mod tests {
     #[test]
     fn substitutes_list_joined() {
         let provider = create_provider();
-        let res =
-            render("foo: {{ list | select_multiple | join('') }}", provider)
-                .unwrap();
+        let res = render("foo: {{ list | select_multiple | join('') }}", provider).unwrap();
 
         assert_eq!(res, "foo: 123".to_string());
     }
@@ -566,8 +522,7 @@ mod tests {
     #[test]
     fn substitutes_list_quoted_join() {
         let provider = create_provider();
-        let res =
-            render(r#"foo: {{ list | select_multiple }}"#, provider).unwrap();
+        let res = render(r#"foo: {{ list | select_multiple }}"#, provider).unwrap();
 
         assert_eq!(res, r#"foo: ["1", "2", "3"]"#.to_string());
     }
@@ -587,11 +542,7 @@ mod tests {
     #[test]
     fn returns_value_missing_when_var_missing_but_other_has_default() {
         let provider = create_provider();
-        let res = render(
-            "{{ with_default | fallback('x') }} {{ missing }}",
-            provider,
-        )
-        .unwrap();
+        let res = render("{{ with_default | fallback('x') }} {{ missing }}", provider).unwrap();
 
         assert_eq!(res, "[fallback: x] [missing: missing]".to_string());
     }
@@ -599,8 +550,7 @@ mod tests {
     #[test]
     fn fallback_filter_is_noop_when_value_present() {
         let provider = create_provider();
-        let res =
-            render("{{ url | fallback('fallback.com') }}", provider).unwrap();
+        let res = render("{{ url | fallback('fallback.com') }}", provider).unwrap();
 
         assert_eq!(res, "example.com".to_string());
     }
@@ -638,12 +588,10 @@ mod tests {
     #[test]
     fn pipes_an_included_file_to_shell() {
         let tmp = Temp::new_dir().unwrap();
-        fs::write(tmp.join("payload.json"), "{\n  \"name\": \"Hitman\"\n}\n")
-            .unwrap();
+        fs::write(tmp.join("payload.json"), "{\n  \"name\": \"Hitman\"\n}\n").unwrap();
         let input = r#"{% filter shell("tr '[:lower:]' '[:upper:]'") %}{% include "payload.json" %}{% endfilter %}"#;
 
-        let res =
-            substitute_in(input, Arc::new(create_provider()), &tmp).unwrap();
+        let res = substitute_in(input, Arc::new(create_provider()), &tmp).unwrap();
 
         assert_eq!(res, "{\n  \"NAME\": \"HITMAN\"\n}\n");
     }

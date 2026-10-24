@@ -79,9 +79,7 @@ pub struct Args {
 fn parse_key_val(s: &str) -> Result<(String, String)> {
     match s.find('=') {
         Some(0) => bail!("empty key in `{s}`"),
-        Some(pos) => {
-            Ok((s[..pos].trim().to_string(), s[pos + 1..].trim().to_string()))
-        }
+        Some(pos) => Ok((s[..pos].trim().to_string(), s[pos + 1..].trim().to_string())),
         None => bail!("no `=` found in `{s}`"),
     }
 }

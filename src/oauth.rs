@@ -10,9 +10,8 @@ use anyhow::{bail, Context, Result};
 use minijinja::Environment;
 use oauth2::{
     basic::{BasicClient, BasicTokenResponse},
-    reqwest, AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret,
-    CsrfToken, PkceCodeChallenge, RedirectUrl, RefreshToken, Scope,
-    TokenResponse, TokenUrl,
+    reqwest, AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
+    PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -82,9 +81,8 @@ struct TokenState {
 
 impl TokenState {
     fn is_valid(&self) -> bool {
-        self.expires_at.is_none_or(|expiry| {
-            expiry > unix_timestamp() + EXPIRY_MARGIN_SECONDS
-        })
+        self.expires_at
+            .is_none_or(|expiry| expiry > unix_timestamp() + EXPIRY_MARGIN_SECONDS)
     }
 }
 
@@ -121,20 +119,13 @@ pub async fn resolve_scope(
     let mut resolved_scope = scope.clone();
 
     for (variable, profile) in requested {
-        if !matches!(scope.lookup(variable)?, Replacement::ValueNotFound { .. })
-        {
+        if !matches!(scope.lookup(variable)?, Replacement::ValueNotFound { .. }) {
             continue;
         }
 
-        let token = resolve_token(
-            &resolved.root_dir,
-            target,
-            variable,
-            profile,
-            &http_client,
-        )
-        .await
-        .with_context(|| format!("OAuth profile `{variable}`"))?;
+        let token = resolve_token(&resolved.root_dir, target, variable, profile, &http_client)
+            .await
+            .with_context(|| format!("OAuth profile `{variable}`"))?;
         resolved_scope.insert(variable.clone(), token.access_token);
     }
 
@@ -176,8 +167,8 @@ fn referenced_variables_in(
         return Ok(HashSet::new());
     }
 
-    let input = fs::read_to_string(path)
-        .with_context(|| format!("When reading template {path:?}"))?;
+    let input =
+        fs::read_to_string(path).with_context(|| format!("When reading template {path:?}"))?;
     let env = Environment::new();
     let template = env.template_from_str(&input)?;
     let mut variables = template.undeclared_variables(false);
@@ -247,18 +238,13 @@ async fn resolve_token(
 
     let token = match profile.flow {
         Flow::AuthorizationCode => authorize(profile, http_client).await?,
-        Flow::ClientCredentials => {
-            client_credentials(profile, http_client).await?
-        }
+        Flow::ClientCredentials => client_credentials(profile, http_client).await?,
     };
     save_token(root_dir, target, variable, &token)?;
     Ok(token)
 }
 
-async fn authorize(
-    profile: &OAuthProfile,
-    http_client: &reqwest::Client,
-) -> Result<TokenState> {
+async fn authorize(profile: &OAuthProfile, http_client: &reqwest::Client) -> Result<TokenState> {
     if !is_interactive_mode() {
         bail!("login required, but Hitman is running non-interactively");
     }
@@ -271,8 +257,7 @@ async fn authorize(
         .redirect_uri
         .as_ref()
         .context("`redirect_uri` is required for authorization_code")?;
-    let redirect =
-        reqwest::Url::parse(redirect_uri).context("Invalid redirect_uri")?;
+    let redirect = reqwest::Url::parse(redirect_uri).context("Invalid redirect_uri")?;
     let listener = bind_callback(&redirect).await?;
 
     let mut client = BasicClient::new(ClientId::new(profile.client_id.clone()))
@@ -395,12 +380,7 @@ async fn wait_for_callback(
                 .read_line(&mut request_line)
                 .await?;
             let Some(path) = request_line.split_whitespace().nth(1) else {
-                write_callback_response(
-                    &mut stream,
-                    400,
-                    "Invalid OAuth callback",
-                )
-                .await?;
+                write_callback_response(&mut stream, 400, "Invalid OAuth callback").await?;
                 continue;
             };
             let callback = redirect.join(path)?;
@@ -411,24 +391,17 @@ async fn wait_for_callback(
 
             let params = callback.query_pairs().collect::<HashMap<_, _>>();
             if let Some(error) = params.get("error") {
-                write_callback_response(&mut stream, 400, "OAuth login failed")
-                    .await?;
+                write_callback_response(&mut stream, 400, "OAuth login failed").await?;
                 bail!("authorization server returned `{error}`");
             }
             let state = params
                 .get("state")
                 .context("OAuth callback omitted state")?;
             if state.as_ref() != expected_state.secret() {
-                write_callback_response(
-                    &mut stream,
-                    400,
-                    "Invalid OAuth state",
-                )
-                .await?;
+                write_callback_response(&mut stream, 400, "Invalid OAuth state").await?;
                 bail!("OAuth state did not match");
             }
-            let code =
-                params.get("code").context("OAuth callback omitted code")?;
+            let code = params.get("code").context("OAuth callback omitted code")?;
             write_callback_response(
                 &mut stream,
                 200,
@@ -456,10 +429,7 @@ async fn write_callback_response(
     Ok(())
 }
 
-fn token_state(
-    response: &BasicTokenResponse,
-    fallback_refresh_token: Option<&str>,
-) -> TokenState {
+fn token_state(response: &BasicTokenResponse, fallback_refresh_token: Option<&str>) -> TokenState {
     TokenState {
         access_token: response.access_token().secret().clone(),
         refresh_token: response
@@ -482,11 +452,7 @@ fn token_state(
     }
 }
 
-fn load_token(
-    root_dir: &Path,
-    target: &str,
-    variable: &str,
-) -> Result<Option<TokenState>> {
+fn load_token(root_dir: &Path, target: &str, variable: &str) -> Result<Option<TokenState>> {
     let data = read_data(root_dir)?;
     let token = data
         .get(OAUTH_STATE_KEY)
@@ -500,12 +466,7 @@ fn load_token(
         .transpose()
 }
 
-fn save_token(
-    root_dir: &Path,
-    target: &str,
-    variable: &str,
-    token: &TokenState,
-) -> Result<()> {
+fn save_token(root_dir: &Path, target: &str, variable: &str, token: &TokenState) -> Result<()> {
     let data = read_data(root_dir)?;
     let mut oauth = data
         .get(OAUTH_STATE_KEY)
@@ -610,8 +571,7 @@ scopes = ["repo"]
             scopes: vec!["repo".into()],
         };
 
-        save_token(&temp, "development", "github_access_token", &token)
-            .unwrap();
+        save_token(&temp, "development", "github_access_token", &token).unwrap();
 
         let loaded = load_token(&temp, "development", "github_access_token")
             .unwrap()
@@ -633,7 +593,8 @@ scopes = ["repo"]
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(request.contains("grant_type=client_credentials"));
 
-            let body = r#"{"access_token":"managed-token","token_type":"Bearer","expires_in":3600}"#;
+            let body =
+                r#"{"access_token":"managed-token","token_type":"Bearer","expires_in":3600}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

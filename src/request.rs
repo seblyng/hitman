@@ -1,6 +1,6 @@
 use anyhow::Result;
 use log::warn;
-use spinoff::{Color, Spinner, Streams, spinners};
+use spinoff::{spinners, Color, Spinner, Streams};
 
 use crate::{
     env::update_data,
@@ -12,11 +12,7 @@ use crate::{
     transport::{self, http::build_client},
 };
 
-pub async fn make_request(
-    resolved: &Resolved,
-    target: &str,
-    scope: &Scope,
-) -> Result<()> {
+pub async fn make_request(resolved: &Resolved, target: &str, scope: &Scope) -> Result<()> {
     let client = build_client(&resolved.root_dir)?;
     let scope = oauth::resolve_scope(resolved, target, scope).await?;
 
@@ -26,12 +22,8 @@ pub async fn make_request(
 
     transport::print_request(&req);
 
-    let mut spinner = Spinner::new_with_stream(
-        spinners::BouncingBar,
-        "",
-        Color::Yellow,
-        Streams::Stderr,
-    );
+    let mut spinner =
+        Spinner::new_with_stream(spinners::BouncingBar, "", Color::Yellow, Streams::Stderr);
 
     let response = match transport::send(&client, &req).await {
         Ok(response) => {

@@ -11,9 +11,8 @@ use http::uri::PathAndQuery;
 use log::{info, log_enabled, Level};
 use prost::Message;
 use prost_reflect::{
-    Cardinality, DescriptorPool, DynamicMessage, FieldDescriptor, Kind,
-    MessageDescriptor, MethodDescriptor, SerializeOptions,
-    Value as ReflectValue,
+    Cardinality, DescriptorPool, DynamicMessage, FieldDescriptor, Kind, MessageDescriptor,
+    MethodDescriptor, SerializeOptions, Value as ReflectValue,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -48,12 +47,8 @@ impl Display for GrpcRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "GRPC {}{}", self.endpoint, self.path)?;
         match &self.descriptor_source {
-            DescriptorSource::Proto(path) => {
-                writeln!(f, "Proto: {}", path.display())?
-            }
-            DescriptorSource::Protoset(path) => {
-                writeln!(f, "Protoset: {}", path.display())?
-            }
+            DescriptorSource::Proto(path) => writeln!(f, "Proto: {}", path.display())?,
+            DescriptorSource::Protoset(path) => writeln!(f, "Protoset: {}", path.display())?,
         }
         for (key, val) in &self.metadata {
             writeln!(f, "{key}: {val}")?;
@@ -77,10 +72,7 @@ pub fn is_grpc_request(rendered: &str) -> bool {
         .is_some_and(|line| line.trim_start().starts_with("GRPC "))
 }
 
-pub fn prepare_request(
-    resolved: &Resolved,
-    rendered: &str,
-) -> Result<GrpcRequest> {
+pub fn prepare_request(resolved: &Resolved, rendered: &str) -> Result<GrpcRequest> {
     let (head, body) = split_head_body(rendered);
     let mut lines = head.lines().filter(|line| !line.trim().is_empty());
     let request_line = lines
@@ -112,16 +104,14 @@ pub fn prepare_request(
             if descriptor_source.is_some() {
                 bail!("Invalid gRPC request: specify only one of Proto or Protoset");
             }
-            descriptor_source = Some(DescriptorSource::Proto(
-                resolve_file_path(resolved, value),
-            ));
+            descriptor_source = Some(DescriptorSource::Proto(resolve_file_path(resolved, value)));
         } else if key.eq_ignore_ascii_case(PROTOSET_HEADER) {
             if descriptor_source.is_some() {
                 bail!("Invalid gRPC request: specify only one of Proto or Protoset");
             }
-            descriptor_source = Some(DescriptorSource::Protoset(
-                resolve_file_path(resolved, value),
-            ));
+            descriptor_source = Some(DescriptorSource::Protoset(resolve_file_path(
+                resolved, value,
+            )));
         } else {
             metadata.push((key.to_ascii_lowercase(), value.to_string()));
         }
@@ -230,11 +220,7 @@ impl Encoder for DynamicEncoder {
     type Item = DynamicMessage;
     type Error = Status;
 
-    fn encode(
-        &mut self,
-        item: Self::Item,
-        dst: &mut EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
         item.encode(dst)
             .map_err(|err| Status::internal(err.to_string()))
     }
@@ -248,10 +234,7 @@ impl Decoder for DynamicDecoder {
     type Item = DynamicMessage;
     type Error = Status;
 
-    fn decode(
-        &mut self,
-        src: &mut DecodeBuf<'_>,
-    ) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
         DynamicMessage::decode(self.response.clone(), src)
             .map(Some)
             .map_err(|err| Status::internal(err.to_string()))
@@ -353,9 +336,7 @@ fn load_method(req: &GrpcRequest) -> Result<MethodDescriptor> {
     Ok(method)
 }
 
-pub fn load_descriptor_pool(
-    source: &DescriptorSource,
-) -> Result<DescriptorPool> {
+pub fn load_descriptor_pool(source: &DescriptorSource) -> Result<DescriptorPool> {
     let descriptors = match source {
         DescriptorSource::Proto(proto_path) => {
             let import_path = proto_path
@@ -365,10 +346,7 @@ pub fn load_descriptor_pool(
         }
         DescriptorSource::Protoset(protoset_path) => {
             let bytes = std::fs::read(protoset_path).with_context(|| {
-                format!(
-                    "Failed to read protoset file {}",
-                    protoset_path.display()
-                )
+                format!("Failed to read protoset file {}", protoset_path.display())
             })?;
             prost_types::FileDescriptorSet::decode(bytes.as_slice())?
         }
@@ -466,9 +444,10 @@ fn should_include_template_field(
         return true;
     }
 
-    let selected = choices.get(oneof.full_name()).cloned().or_else(|| {
-        oneof.fields().next().map(|field| field.name().to_string())
-    });
+    let selected = choices
+        .get(oneof.full_name())
+        .cloned()
+        .or_else(|| oneof.fields().next().map(|field| field.name().to_string()));
 
     selected.as_deref() == Some(field.name())
 }
@@ -481,16 +460,12 @@ fn next_template_choice(
 
     for field in desc.fields() {
         if let Some(oneof) = field.containing_oneof() {
-            if oneof.is_synthetic()
-                || seen_oneofs.iter().any(|seen| seen == oneof.full_name())
-            {
+            if oneof.is_synthetic() || seen_oneofs.iter().any(|seen| seen == oneof.full_name()) {
                 continue;
             }
             seen_oneofs.push(oneof.full_name().to_string());
 
-            if oneof.fields().len() > 1
-                && !choices.contains_key(oneof.full_name())
-            {
+            if oneof.fields().len() > 1 && !choices.contains_key(oneof.full_name()) {
                 return Some(MessageTemplateChoiceGroup {
                     oneof: oneof.full_name().to_string(),
                     oneof_label: oneof.name().to_string(),
@@ -531,9 +506,7 @@ fn template_field_value(
     }
 
     if field.cardinality() == Cardinality::Repeated {
-        return ReflectValue::List(vec![template_singular_field_value(
-            field, choices,
-        )]);
+        return ReflectValue::List(vec![template_singular_field_value(field, choices)]);
     }
 
     template_singular_field_value(field, choices)
@@ -553,9 +526,7 @@ fn template_singular_field_value(
         Kind::Bool => ReflectValue::Bool(false),
         Kind::String => ReflectValue::String(String::new()),
         Kind::Bytes => ReflectValue::Bytes(Vec::new().into()),
-        Kind::Message(message) => {
-            ReflectValue::Message(build_template_message(&message, choices))
-        }
+        Kind::Message(message) => ReflectValue::Message(build_template_message(&message, choices)),
         Kind::Enum(en) => ReflectValue::EnumNumber(
             en.values()
                 .next()
@@ -618,9 +589,7 @@ Authorization: Bearer abc
         assert_eq!(request.path, "/example.UserService/GetUser");
         assert_eq!(
             request.descriptor_source,
-            DescriptorSource::Proto(PathBuf::from(
-                "/tmp/project/proto/user.proto"
-            ))
+            DescriptorSource::Proto(PathBuf::from("/tmp/project/proto/user.proto"))
         );
         assert_eq!(
             request.metadata,
@@ -631,8 +600,7 @@ Authorization: Bearer abc
 
     #[test]
     fn parses_grpcs_target() {
-        let (endpoint, path) =
-            parse_target("grpcs://example.com/package.Service/Method").unwrap();
+        let (endpoint, path) = parse_target("grpcs://example.com/package.Service/Method").unwrap();
 
         assert_eq!(endpoint, "https://example.com");
         assert_eq!(path, "/package.Service/Method");
@@ -703,8 +671,7 @@ Authorization: Bearer abc
         )
         .unwrap();
 
-        let descriptors =
-            protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
+        let descriptors = protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
         let protoset = tmp.join("protoset.bin");
         fs::write(&protoset, descriptors.encode_to_vec()).unwrap();
 
@@ -744,10 +711,8 @@ Authorization: Bearer abc
             "#,
         )
         .unwrap();
-        let descriptors =
-            protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
-        let pool =
-            DescriptorPool::from_file_descriptor_set(descriptors).unwrap();
+        let descriptors = protox::compile([proto.as_path()], [tmp.as_path()]).unwrap();
+        let pool = DescriptorPool::from_file_descriptor_set(descriptors).unwrap();
         let request = pool
             .get_message_by_name("example.CreateOrderRequest")
             .unwrap();
