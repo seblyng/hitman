@@ -9,11 +9,7 @@ use crate::{
     prompt::get_interaction,
     resolve::Resolved,
     scope::Scope,
-    transport::{
-        self,
-        http::{build_client, do_request},
-        PreparedRequest,
-    },
+    transport::{self, http::build_client},
 };
 
 pub async fn monitor(
@@ -33,19 +29,14 @@ pub async fn monitor(
     loop {
         let scope = oauth::resolve_scope(resolved, target, scope).await?;
         let interaction = get_interaction(scope);
-        let req = match transport::prepare_request(resolved, interaction)? {
-            PreparedRequest::Http(req) => req,
-            PreparedRequest::GraphQL(req) => req.http,
-            PreparedRequest::Grpc(_) => {
-                bail!("Monitor mode does not support gRPC requests yet")
-            }
-        };
-        let res = do_request(&client, &req).await;
+
+        let req = transport::prepare_request(resolved, interaction)?;
+        let res = transport::send(&client, &req).await;
 
         match res {
-            Ok((res, elapsed)) => {
+            Ok(res) => {
                 let ts = chrono::Utc::now();
-                println!("{}, {}, {:.2?}", ts, res.status().as_u16(), elapsed);
+                println!("{}, {}, {:.2?}", ts, res.status_code(), res.elapsed);
             }
             Err(e) => {
                 eprintln!("{e}");

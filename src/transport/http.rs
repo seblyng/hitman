@@ -151,41 +151,7 @@ pub fn parse_headers(req: &httparse::Request<'_, '_>) -> Result<HeaderMap> {
     Ok(headers)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::prepare_request;
-
-    #[test]
-    fn ignores_comments_in_request_section_but_preserves_json_body() {
-        let request = prepare_request(
-            "# request note\nGET https://example.com HTTP/1.1 # request trailing note\n# header note\nContent-Type: application/json # header trailing note\n\n{\n  \"text\": \"# not a comment\"\n}\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            request.body.unwrap().into_string(),
-            "{\n  \"text\": \"# not a comment\"\n}\n"
-        );
-        assert_eq!(request.headers["content-type"], "application/json");
-    }
-}
-
 pub async fn send(client: &Client, req: &HttpRequest) -> Result<(Response, Duration)> {
-    do_request(client, req).await
-}
-
-pub async fn finish_response(response: Response) -> Result<Option<Value>> {
-    print_response(&response)?;
-
-    let json = response.json::<Value>().await.ok();
-    if let Some(json) = &json {
-        println!("{}", serde_json::to_string_pretty(json)?);
-    }
-
-    Ok(json)
-}
-
-pub async fn do_request(client: &Client, req: &HttpRequest) -> Result<(Response, Duration)> {
     let mut builder = client.request(req.method.clone(), req.url.clone());
     builder = builder.headers(req.headers.clone());
     if let Some(ref body) = req.body {
@@ -198,6 +164,17 @@ pub async fn do_request(client: &Client, req: &HttpRequest) -> Result<(Response,
     let elapsed = t.elapsed();
 
     Ok((response, elapsed))
+}
+
+pub async fn finish_response(response: Response) -> Result<Option<Value>> {
+    print_response(&response)?;
+
+    let json = response.json::<Value>().await.ok();
+    if let Some(json) = &json {
+        println!("{}", serde_json::to_string_pretty(json)?);
+    }
+
+    Ok(json)
 }
 
 pub fn print_request(req: &HttpRequest) {
@@ -230,4 +207,23 @@ pub fn print_response(res: &Response) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_request;
+
+    #[test]
+    fn ignores_comments_in_request_section_but_preserves_json_body() {
+        let request = prepare_request(
+            "# request note\nGET https://example.com HTTP/1.1 # request trailing note\n# header note\nContent-Type: application/json # header trailing note\n\n{\n  \"text\": \"# not a comment\"\n}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.body.unwrap().into_string(),
+            "{\n  \"text\": \"# not a comment\"\n}\n"
+        );
+        assert_eq!(request.headers["content-type"], "application/json");
+    }
 }

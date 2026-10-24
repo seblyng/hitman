@@ -10,11 +10,7 @@ use crate::{
     prompt::get_interaction,
     resolve::Resolved,
     scope::Scope,
-    transport::{
-        self,
-        http::{build_client, do_request},
-        PreparedRequest,
-    },
+    transport::{self, http::build_client},
     util::{split_work, IterExt},
 };
 
@@ -38,13 +34,7 @@ pub async fn flurry_attack(
     warn!("# Sending {flurry_size} requests on {connections} parallel connections...");
 
     let interaction = get_interaction(scope);
-    let req = match transport::prepare_request(resolved, interaction)? {
-        PreparedRequest::Http(req) => req,
-        PreparedRequest::GraphQL(req) => req.http,
-        PreparedRequest::Grpc(_) => {
-            bail!("Flurry mode does not support gRPC requests yet")
-        }
-    };
+    let req = transport::prepare_request(resolved, interaction)?;
 
     let t = std::time::Instant::now();
     let mut spinner =
@@ -59,8 +49,8 @@ pub async fn flurry_attack(
         spawn(async move {
             let mut results = Vec::new();
             for _ in 0..size {
-                let res = match do_request(&client, &req).await {
-                    Ok((res, elapsed)) => Some((res.status().as_u16(), elapsed)),
+                let res = match transport::send(&client, &req).await {
+                    Ok(res) => Some((res.status_code(), res.elapsed)),
                     Err(_) => None,
                 };
                 results.push(res);

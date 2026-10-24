@@ -2,7 +2,7 @@ use std::{fmt::Display, path::Path, sync::Arc};
 
 use anyhow::{bail, Result};
 use graphql_parser::query::{Definition, OperationDefinition, VariableDefinition};
-use reqwest::{header::CONTENT_TYPE, Client};
+use reqwest::header::CONTENT_TYPE;
 use serde_json::{json, Value};
 
 use crate::{
@@ -47,13 +47,6 @@ pub fn prepare_request(
     http.body = Some(http::HttpBody::new(body));
 
     Ok(GraphQLRequest { http })
-}
-
-pub async fn send(
-    client: &Client,
-    req: &GraphQLRequest,
-) -> Result<(reqwest::Response, std::time::Duration)> {
-    http::do_request(client, &req.http).await
 }
 
 pub async fn finish_response(response: reqwest::Response) -> Result<Option<Value>> {

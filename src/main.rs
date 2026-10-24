@@ -46,29 +46,20 @@ async fn main() -> Result<()> {
     let cwd = current_dir()?;
 
     let result = if let Some(file_path) = args.name {
-        let file_path = cwd.join(file_path);
-        let resolved = resolve_path(&file_path)?;
+        let resolved = resolve_path(&cwd.join(file_path))?;
 
         let target = args
             .target
-            .clone()
             .unwrap_or_else(|| get_target(&resolved.root_dir));
 
+        let scope = load_env(&target, &resolved, &args.options)?;
         if let Some(flurry_size) = args.flurry {
-            let scope = load_env(&target, &resolved, &args.options)?;
-            flurry_attack(
-                &resolved,
-                &target,
-                flurry_size,
-                args.connections.unwrap_or(10),
-                &scope,
-            )
-            .await
+            let connections = args.connections.unwrap_or(10);
+            flurry_attack(&resolved, &target, flurry_size, connections, &scope).await
         } else if let Some(delay_seconds) = args.monitor {
-            let scope = load_env(&target, &resolved, &args.options)?;
             monitor(&resolved, &target, delay_seconds, &scope).await
         } else {
-            let res = run_once(&target, &resolved, &args.options).await;
+            let res = make_request(&resolved, &target, &scope).await;
 
             if args.watch {
                 watch_mode(&target, &resolved, &args.options).await
@@ -98,7 +89,8 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| get_target(&resolved.root_dir));
 
-            let result = run_once(&target, &resolved, &args.options).await;
+            let scope = load_env(&target, &resolved, &args.options)?;
+            let result = make_request(&resolved, &target, &scope).await;
 
             if !args.repeat {
                 break result;
@@ -132,12 +124,6 @@ fn is_user_cancelation(err: &anyhow::Error) -> bool {
     )
 }
 
-async fn run_once(target: &str, resolved: &Resolved, options: &[(String, String)]) -> Result<()> {
-    let scope = load_env(target, resolved, options)?;
-
-    make_request(resolved, target, &scope).await
-}
-
 async fn watch_mode(target: &str, resolved: &Resolved, options: &[(String, String)]) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -151,7 +137,9 @@ async fn watch_mode(target: &str, resolved: &Resolved, options: &[(String, Strin
         if let Some(event) = rx.recv().await {
             if let EventKind::Modify(_) = event.kind {
                 watcher.unwatch_all()?;
-                if let Err(err) = run_once(target, resolved, options).await {
+
+                let scope = load_env(target, resolved, options)?;
+                if let Err(err) = make_request(resolved, target, &scope).await {
                     error!("# {err}");
                 }
                 watcher.watch_all()?;

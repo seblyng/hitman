@@ -27,10 +27,20 @@ pub struct ExecutionResult {
 
 pub struct TransportResponse {
     pub elapsed: Duration,
-    response: TransportResponseBody,
+    pub response: TransportResponseBody,
 }
 
-enum TransportResponseBody {
+impl TransportResponse {
+    pub fn status_code(&self) -> u16 {
+        match &self.response {
+            TransportResponseBody::Http(resp) => resp.status().as_u16(),
+            TransportResponseBody::GraphQL(resp) => resp.status().as_u16(),
+            TransportResponseBody::Grpc(_) => 0, // gRPC status code is 0 for when we have a success body
+        }
+    }
+}
+
+pub enum TransportResponseBody {
     Http(reqwest::Response),
     GraphQL(reqwest::Response),
     Grpc(Value),
@@ -68,9 +78,10 @@ fn parse_local_variables(input: &str) -> Result<(String, HashMap<String, minijin
             .split_once('#')
             .map_or(trimmed, |(before, _)| before)
             .trim_end();
-        if declaration.starts_with('@') {
+
+        if let Some(declaration) = declaration.strip_prefix('@') {
             declarations_started = true;
-            let (key, value) = declaration[1..].split_once('=').ok_or_else(|| {
+            let (key, value) = declaration.split_once('=').ok_or_else(|| {
                 anyhow::anyhow!(
                     "Invalid variable declaration `{declaration}`; expected `@name = value`"
                 )
@@ -92,6 +103,53 @@ fn parse_local_variables(input: &str) -> Result<(String, HashMap<String, minijin
     }
 
     Ok((input[body_start..].to_string(), values))
+}
+
+pub async fn send(client: &Client, request: &PreparedRequest) -> Result<TransportResponse> {
+    match request {
+        PreparedRequest::Http(req) => {
+            let (response, elapsed) = http::send(client, req).await?;
+            Ok(TransportResponse {
+                elapsed,
+                response: TransportResponseBody::Http(response),
+            })
+        }
+        PreparedRequest::GraphQL(req) => {
+            let (response, elapsed) = http::send(client, &req.http).await?;
+            Ok(TransportResponse {
+                elapsed,
+                response: TransportResponseBody::GraphQL(response),
+            })
+        }
+        PreparedRequest::Grpc(req) => {
+            let (json, elapsed) = grpc::send(req).await?;
+            Ok(TransportResponse {
+                elapsed,
+                response: TransportResponseBody::Grpc(json),
+            })
+        }
+    }
+}
+
+pub async fn finish_response(response: TransportResponse) -> Result<ExecutionResult> {
+    let json = match response.response {
+        TransportResponseBody::Http(response) => http::finish_response(response).await?,
+        TransportResponseBody::GraphQL(response) => graphql::finish_response(response).await?,
+        TransportResponseBody::Grpc(json) => grpc::finish_response(&json)?,
+    };
+
+    Ok(ExecutionResult {
+        elapsed: response.elapsed,
+        json,
+    })
+}
+
+pub fn print_request(request: &PreparedRequest) {
+    match request {
+        PreparedRequest::Http(req) => http::print_request(req),
+        PreparedRequest::GraphQL(req) => graphql::print_request(req),
+        PreparedRequest::Grpc(req) => grpc::print_request(req),
+    }
 }
 
 #[cfg(test)]
@@ -132,52 +190,5 @@ mod tests {
     #[test]
     fn rejects_malformed_leading_declaration() {
         assert!(parse_local_variables("@missing_equals\nGET / HTTP/1.1\n").is_err());
-    }
-}
-
-pub async fn send(client: &Client, request: &PreparedRequest) -> Result<TransportResponse> {
-    match request {
-        PreparedRequest::Http(req) => {
-            let (response, elapsed) = http::send(client, req).await?;
-            Ok(TransportResponse {
-                elapsed,
-                response: TransportResponseBody::Http(response),
-            })
-        }
-        PreparedRequest::GraphQL(req) => {
-            let (response, elapsed) = graphql::send(client, req).await?;
-            Ok(TransportResponse {
-                elapsed,
-                response: TransportResponseBody::GraphQL(response),
-            })
-        }
-        PreparedRequest::Grpc(req) => {
-            let (json, elapsed) = grpc::send(req).await?;
-            Ok(TransportResponse {
-                elapsed,
-                response: TransportResponseBody::Grpc(json),
-            })
-        }
-    }
-}
-
-pub async fn finish_response(response: TransportResponse) -> Result<ExecutionResult> {
-    let json = match response.response {
-        TransportResponseBody::Http(response) => http::finish_response(response).await?,
-        TransportResponseBody::GraphQL(response) => graphql::finish_response(response).await?,
-        TransportResponseBody::Grpc(json) => grpc::finish_response(&json)?,
-    };
-
-    Ok(ExecutionResult {
-        elapsed: response.elapsed,
-        json,
-    })
-}
-
-pub fn print_request(request: &PreparedRequest) {
-    match request {
-        PreparedRequest::Http(req) => http::print_request(req),
-        PreparedRequest::GraphQL(req) => graphql::print_request(req),
-        PreparedRequest::Grpc(req) => grpc::print_request(req),
     }
 }
