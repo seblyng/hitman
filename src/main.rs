@@ -4,6 +4,7 @@ use inquire::{list_option::ListOption, Select};
 use log::{error, info};
 use notify::EventKind;
 use std::env::current_dir;
+use std::num::NonZero;
 use tokio::sync::mpsc;
 
 use hitman::env::{
@@ -34,7 +35,7 @@ async fn main() -> Result<()> {
     set_interactive_mode(!(args.non_interactive || args.watch));
 
     if let Some(arg) = args.select {
-        let root_dir = find_root_dir(&current_dir()?)?.context("No hitman.toml found")?;
+        let root_dir = find_root_dir(&current_dir()?).context("No hitman.toml found")?;
 
         match arg {
             Some(target) => set_target(&root_dir, &target)?,
@@ -54,8 +55,8 @@ async fn main() -> Result<()> {
 
         let scope = load_env(&target, &resolved, &args.options)?;
         if let Some(flurry_size) = args.flurry {
-            let connections = args.connections.unwrap_or(10);
-            flurry_attack(&resolved, &target, flurry_size, connections, &scope).await
+            let connections = args.connections.unwrap_or(NonZero::new(10).unwrap()).get();
+            flurry_attack(&resolved, &target, flurry_size.into(), connections, &scope).await
         } else if let Some(delay_seconds) = args.monitor {
             monitor(&resolved, &target, delay_seconds, &scope).await
         } else {

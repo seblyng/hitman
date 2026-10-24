@@ -51,7 +51,7 @@ impl CookieStore for HitmanCookieJar {
     }
 
     fn cookies(&self, _: &Url) -> Option<reqwest::header::HeaderValue> {
-        let data_file = read_toml(&self.root_dir.join(DATA_FILE)).ok().flatten()?;
+        let data_file = read_data(&self.root_dir).ok()?;
 
         match data_file.get(COOKIE_KEY)? {
             Value::Array(arr) => {
@@ -137,7 +137,7 @@ pub fn load_env(target: &str, resolved: &Resolved, options: &[(String, String)])
     }
 
     // FIXME state per environment
-    if let Some(content) = read_toml(&resolved.root_dir.join(DATA_FILE))? {
+    if let Ok(content) = read_data(&resolved.root_dir) {
         table.extend(content);
     }
 
@@ -161,9 +161,7 @@ pub fn update_data(root_dir: &Path, vars: &TomlTable) -> Result<()> {
 
     let data_file = root_dir.join(DATA_FILE);
 
-    let content = fs::read_to_string(&data_file).unwrap_or_else(|_| String::default());
-
-    let mut state = toml::from_str::<TomlTable>(&content).unwrap_or_default();
+    let mut state = read_data(root_dir).unwrap_or_default();
 
     state.extend(vars.clone());
     fs::write(&data_file, toml::to_string_pretty(&state)?)?;

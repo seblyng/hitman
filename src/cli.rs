@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use anyhow::{bail, Result};
 use clap::Parser;
 
@@ -52,7 +54,7 @@ pub struct Args {
     /// Flurry attack an API by sending many identical requests in a short
     /// time.
     #[arg(short, long, conflicts_with = "repeat", requires = "name")]
-    pub flurry: Option<i32>,
+    pub flurry: Option<NonZeroU32>,
 
     /// Repeat the same request indefinely, with the given number of seconds
     /// delay between hits.
@@ -68,7 +70,7 @@ pub struct Args {
 
     /// Number concurrent connections used in a flurry attack.
     #[arg(short, long, requires = "flurry")]
-    pub connections: Option<i32>,
+    pub connections: Option<NonZeroU32>,
 
     /// Watch file for changes (implies non-interactove).
     #[arg(short, long, requires = "name", conflicts_with = "flurry")]

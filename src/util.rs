@@ -36,11 +36,11 @@ where
 }
 
 pub struct SplitWork {
-    total_count: i32,
-    workers: i32,
+    total_count: u32,
+    workers: u32,
 }
 
-pub fn split_work(total_count: i32, workers: i32) -> SplitWork {
+pub fn split_work(total_count: u32, workers: u32) -> SplitWork {
     SplitWork {
         total_count,
         workers,
@@ -48,11 +48,11 @@ pub fn split_work(total_count: i32, workers: i32) -> SplitWork {
 }
 
 impl Iterator for SplitWork {
-    type Item = i32;
+    type Item = u32;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.total_count > 0 {
-            let c = (self.total_count + self.workers - 1) / self.workers;
+            let c = self.total_count.div_ceil(self.workers);
             self.total_count -= c;
             self.workers -= 1;
             Some(c)

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use futures::future::join_all;
 use log::warn;
 use spinoff::{spinners, Color, Spinner, Streams};
@@ -17,17 +17,10 @@ use crate::{
 pub async fn flurry_attack(
     resolved: &Resolved,
     target: &str,
-    flurry_size: i32,
-    connections: i32,
+    flurry_size: u32,
+    connections: u32,
     scope: &Scope,
 ) -> Result<()> {
-    if flurry_size < 1 {
-        bail!("Flurry size must be at least 1");
-    }
-    if connections < 1 {
-        bail!("Connections must be at least 1");
-    }
-
     let client = build_client(&resolved.root_dir)?;
     let scope = oauth::resolve_scope(resolved, target, scope).await?;
 

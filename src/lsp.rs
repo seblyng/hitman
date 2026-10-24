@@ -1698,7 +1698,7 @@ fn diagnostic_template_value(file_path: &Path, text: &str, value: &str) -> Resul
     if !value.contains("{{") && !value.contains("{%") {
         return Ok(value.to_string());
     }
-    let root_dir = find_root_dir(file_path)?
+    let root_dir = find_root_dir(file_path)
         .unwrap_or_else(|| file_path.parent().unwrap_or(Path::new(".")).into());
     let resolved = Resolved {
         root_dir: root_dir.clone(),
@@ -1811,7 +1811,7 @@ fn template_variable(target: &str) -> Option<String> {
 }
 
 fn resolve_hitman_variable(file_path: &Path, key: &str) -> Result<String> {
-    let root = find_root_dir(file_path)?.context("Could not find hitman root")?;
+    let root = find_root_dir(file_path).context("Could not find hitman root")?;
     let resolved = Resolved {
         root_dir: root.clone(),
         resolved_as: ResolvedAs::Simple {

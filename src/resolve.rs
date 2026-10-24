@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 
 const CONFIG_FILE: &str = "hitman.toml";
 
@@ -49,10 +49,15 @@ impl Resolved {
 }
 
 pub fn resolve_path(path: &Path) -> Result<Resolved> {
-    let root_dir = find_root_dir(path)?.unwrap_or(current_dir()?.into());
+    let root_dir = find_root_dir(path).unwrap_or(current_dir()?.into());
 
     let resolved_as = if is_graphql(path) {
-        let template_path = resolve_graphql_http_file(path)?;
+        let Some(template_path) = path
+            .ancestors()
+            .find(|dir| dir.join("_graphql.http").exists())
+        else {
+            anyhow::bail!("Couldn't find _graphql.http in any parent directory");
+        };
         ResolvedAs::GraphQL {
             wrapper_path: template_path.into(),
             graphql_path: path.into(),
@@ -76,36 +81,10 @@ pub fn is_graphql(path: &Path) -> bool {
 
 // The root dir is where we find hitman.toml,
 // scanning parent directories until we find it
-pub fn find_root_dir(path: &Path) -> Result<Option<Box<Path>>> {
-    let mut dir: Box<Path> = path.into();
-    let res = loop {
-        if dir.join(CONFIG_FILE).exists() {
-            break Some(dir);
-        }
-        if let Some(parent) = dir.parent() {
-            dir = parent.into();
-        } else {
-            break None;
-        }
-    };
-
-    Ok(res)
-}
-
-// FIXME: This is very similar to `find_root_dir`
-pub fn resolve_graphql_http_file(path: &Path) -> Result<PathBuf> {
-    let mut dir = path.parent().context("No parent")?.to_path_buf();
-    loop {
-        let file = dir.join("_graphql.http");
-        if file.exists() {
-            return Ok(file);
-        }
-        if let Some(parent) = dir.parent() {
-            dir = parent.to_path_buf();
-        } else {
-            bail!("Couldn't find _graphql.http");
-        }
-    }
+pub fn find_root_dir(path: &Path) -> Option<Box<Path>> {
+    path.ancestors()
+        .find(|dir| dir.join(CONFIG_FILE).exists())
+        .map(|it| it.into())
 }
 
 fn with_suffix(s: &OsStr, suffix: &str) -> OsString {
