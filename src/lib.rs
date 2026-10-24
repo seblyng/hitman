@@ -1,7 +1,6 @@
 pub mod env;
 pub mod extract;
 pub mod flurry;
-pub mod lsp;
 pub mod monitor;
 pub mod oauth;
 pub mod request;
