@@ -603,13 +603,42 @@ struct JsonCompletionContext {
 struct JsonFrame {
     field: Option<String>,
     kind: JsonFrameKind,
-    fields: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
 enum JsonFrameKind {
     Object,
     Array,
+}
+
+#[derive(PartialEq)]
+enum JsonStringRole {
+    Key,
+    Value,
+    Other,
+}
+
+struct JsonStringState {
+    role: JsonStringRole,
+    text: String,
+    escaped: bool,
+}
+
+impl JsonStringState {
+    /// Consume a character, returning true at the closing quote.
+    fn push(&mut self, ch: char) -> bool {
+        if self.escaped {
+            self.text.push(ch);
+            self.escaped = false;
+        } else {
+            match ch {
+                '\\' => self.escaped = true,
+                '"' => return true,
+                _ => self.text.push(ch),
+            }
+        }
+        false
+    }
 }
 
 fn completion_for_position(
@@ -952,37 +981,22 @@ fn json_completion_context(prefix: &str) -> JsonCompletionContext {
     let mut frames: Vec<JsonFrame> = Vec::new();
     let mut pending_field: Option<String> = None;
     let mut last_string: Option<String> = None;
-    let mut in_string = false;
-    let mut string_is_value = false;
-    let mut string_is_key = false;
+    let mut string: Option<JsonStringState> = None;
     let mut key_start = None;
     let mut value_start = None;
-    let mut escape = false;
-    let mut string = String::new();
     let mut saw_colon_since_string = false;
     let mut last_non_ws = None;
 
     for (offset, ch) in prefix.char_indices() {
-        if in_string {
-            if escape {
-                string.push(ch);
-                escape = false;
-                continue;
-            }
-            match ch {
-                '\\' => escape = true,
-                '"' => {
-                    in_string = false;
-                    last_string = Some(std::mem::take(&mut string));
-                    if string_is_value {
-                        pending_field = None;
-                    }
-                    string_is_value = false;
-                    string_is_key = false;
-                    saw_colon_since_string = false;
-                    last_non_ws = Some('"');
+        if let Some(state) = string.as_mut() {
+            if state.push(ch) {
+                let state = string.take().unwrap();
+                if state.role == JsonStringRole::Value {
+                    pending_field = None;
                 }
-                _ => string.push(ch),
+                last_string = Some(state.text);
+                saw_colon_since_string = false;
+                last_non_ws = Some('"');
             }
             continue;
         }
@@ -993,126 +1007,92 @@ fn json_completion_context(prefix: &str) -> JsonCompletionContext {
 
         match ch {
             '"' => {
-                in_string = true;
-                string_is_value = pending_field.is_some()
-                    && matches!(last_non_ws, Some(':') | Some('[') | Some(','));
-                string_is_key = frames
+                let role = if pending_field.is_some()
+                    && matches!(last_non_ws, Some(':') | Some('[') | Some(','))
+                {
+                    value_start = Some(offset + 1);
+                    JsonStringRole::Value
+                } else if frames
                     .last()
                     .is_some_and(|frame| frame.kind == JsonFrameKind::Object)
                     && pending_field.is_none()
-                    && matches!(last_non_ws, Some('{') | Some(','));
-                if string_is_key {
+                    && matches!(last_non_ws, Some('{') | Some(','))
+                {
                     key_start = Some(offset);
-                }
-                if string_is_value {
-                    value_start = Some(offset + 1);
-                }
-                string.clear();
-                last_non_ws = Some(ch);
+                    JsonStringRole::Key
+                } else {
+                    JsonStringRole::Other
+                };
+                string = Some(JsonStringState {
+                    role,
+                    text: String::new(),
+                    escaped: false,
+                });
             }
             ':' => {
                 if let Some(key) = last_string.take() {
-                    if let Some(frame) = frames
-                        .last_mut()
-                        .filter(|frame| frame.kind == JsonFrameKind::Object)
-                    {
-                        frame.fields.push(key.clone());
-                    }
                     pending_field = Some(key);
                 }
                 saw_colon_since_string = true;
-                last_non_ws = Some(ch);
             }
-            ',' => {
+            ',' | '{' | '[' | '}' | ']' => {
+                match ch {
+                    '{' => {
+                        frames.push(JsonFrame {
+                            field: pending_field.take().or_else(|| array_field(&frames)),
+                            kind: JsonFrameKind::Object,
+                        });
+                    }
+                    '[' => {
+                        frames.push(JsonFrame {
+                            field: pending_field.take(),
+                            kind: JsonFrameKind::Array,
+                        });
+                    }
+                    '}' | ']' => {
+                        frames.pop();
+                    }
+                    _ => {}
+                }
                 pending_field = None;
                 last_string = None;
                 key_start = None;
                 value_start = None;
                 saw_colon_since_string = false;
-                last_non_ws = Some(ch);
             }
-            '{' => {
-                let field = pending_field.take().or_else(|| {
-                    frames.last().and_then(|frame| {
-                        (frame.kind == JsonFrameKind::Array)
-                            .then(|| frame.field.clone())
-                            .flatten()
-                    })
-                });
-                frames.push(JsonFrame {
-                    field,
-                    kind: JsonFrameKind::Object,
-                    fields: Vec::new(),
-                });
-                last_string = None;
-                key_start = None;
-                value_start = None;
-                saw_colon_since_string = false;
-                last_non_ws = Some(ch);
-            }
-            '[' => {
-                frames.push(JsonFrame {
-                    field: pending_field.take(),
-                    kind: JsonFrameKind::Array,
-                    fields: Vec::new(),
-                });
-                last_string = None;
-                key_start = None;
-                value_start = None;
-                saw_colon_since_string = false;
-                last_non_ws = Some(ch);
-            }
-            '}' | ']' => {
-                frames.pop();
-                pending_field = None;
-                last_string = None;
-                key_start = None;
-                value_start = None;
-                saw_colon_since_string = false;
-                last_non_ws = Some(ch);
-            }
-            _ => {
-                last_non_ws = Some(ch);
-            }
+            _ => {}
         }
+        last_non_ws = Some(ch);
     }
 
-    let path = frames
-        .iter()
-        .filter(|frame| frame.kind == JsonFrameKind::Object)
-        .filter_map(|frame| frame.field.clone())
-        .collect::<Vec<_>>();
-    let in_array_field = frames
-        .last()
-        .and_then(|frame| (frame.kind == JsonFrameKind::Array).then(|| frame.field.clone()))
-        .flatten();
-    let field = pending_field.clone().or(in_array_field);
+    let field = pending_field.or_else(|| array_field(&frames));
     let current_object = frames
         .last()
         .is_some_and(|frame| frame.kind == JsonFrameKind::Object);
-    let existing_fields = frames
-        .last()
-        .filter(|frame| frame.kind == JsonFrameKind::Object)
-        .map(|frame| frame.fields.clone())
-        .unwrap_or_default();
     let expecting_key = current_object
         && field.is_none()
-        && if in_string {
-            string_is_key
-        } else {
-            matches!(last_non_ws, Some('{') | Some(','))
+        && match &string {
+            Some(state) => state.role == JsonStringRole::Key,
+            None => matches!(last_non_ws, Some('{') | Some(',')),
         }
         && !saw_colon_since_string;
 
     JsonCompletionContext {
-        path,
+        path: object_path(&frames),
         field,
-        existing_fields,
         key_start,
         value_start,
         expecting_key,
-        in_string,
+        in_string: string.is_some(),
+        ..Default::default()
     }
+}
+
+fn array_field(frames: &[JsonFrame]) -> Option<String> {
+    frames
+        .last()
+        .filter(|frame| frame.kind == JsonFrameKind::Array)
+        .and_then(|frame| frame.field.clone())
 }
 
 fn existing_fields_for_path(body: &str, target_path: &[String]) -> Vec<String> {
@@ -1160,17 +1140,10 @@ fn existing_fields_for_path(body: &str, target_path: &[String]) -> Vec<String> {
                 pending_field = None;
             }
             '{' => {
-                let field = pending_field.take().or_else(|| {
-                    frames.last().and_then(|frame| {
-                        (frame.kind == JsonFrameKind::Array)
-                            .then(|| frame.field.clone())
-                            .flatten()
-                    })
-                });
+                let field = pending_field.take().or_else(|| array_field(&frames));
                 frames.push(JsonFrame {
                     field,
                     kind: JsonFrameKind::Object,
-                    fields: Vec::new(),
                 });
                 last_string = None;
             }
@@ -1178,7 +1151,6 @@ fn existing_fields_for_path(body: &str, target_path: &[String]) -> Vec<String> {
                 frames.push(JsonFrame {
                     field: pending_field.take(),
                     kind: JsonFrameKind::Array,
-                    fields: Vec::new(),
                 });
                 last_string = None;
             }
