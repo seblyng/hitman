@@ -95,7 +95,9 @@ fn parse_local_variables(input: &str) -> Result<(String, HashMap<String, minijin
                 minijinja::Value::from(value.trim().to_string()),
             );
             body_start += line.len();
-        } else if declarations_started && trimmed.trim().is_empty() {
+        } else if declarations_started
+            && (trimmed.trim().is_empty() || trimmed.trim_start().starts_with('#'))
+        {
             body_start += line.len();
         } else {
             break;
@@ -176,6 +178,15 @@ mod tests {
 
         assert_eq!(values["base_url"].as_str(), Some("https://example.com"));
         assert_eq!(body, "GET {{base_url}} HTTP/1.1\n");
+    }
+
+    #[test]
+    fn parses_local_variables_with_interspersed_comment_lines() {
+        let input = "@id=old\n# @id=commented\n@id=new\n\nGET /{{id}} HTTP/1.1\n";
+        let (body, values) = parse_local_variables(input).unwrap();
+
+        assert_eq!(values["id"].as_str(), Some("new"));
+        assert_eq!(body, "GET /{{id}} HTTP/1.1\n");
     }
 
     #[test]
